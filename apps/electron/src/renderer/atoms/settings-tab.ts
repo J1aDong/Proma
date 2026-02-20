@@ -6,12 +6,13 @@
  * - channels: 渠道配置
  * - proxy: 代理配置
  * - appearance: 外观设置
+ * - plugins: 插件管理
  * - about: 关于
  */
 
 import { atom } from 'jotai'
 
-export type SettingsTab = 'general' | 'channels' | 'proxy' | 'appearance' | 'about' | 'agent'
+export type SettingsTab = 'general' | 'channels' | 'proxy' | 'appearance' | 'plugins' | 'about' | 'agent'
 
 /** 当前设置标签页（不持久化，每次打开设置默认显示渠道） */
 export const settingsTabAtom = atom<SettingsTab>('channels')

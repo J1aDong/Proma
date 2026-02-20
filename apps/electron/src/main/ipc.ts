@@ -5,7 +5,7 @@
  */
 
 import { ipcMain, nativeTheme, shell, dialog, BrowserWindow } from 'electron'
-import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS } from '@proma/shared'
+import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, PLUGIN_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS } from '@proma/shared'
 import { USER_PROFILE_IPC_CHANNELS, SETTINGS_IPC_CHANNELS } from '../types'
 import type {
   RuntimeStatus,
@@ -47,6 +47,14 @@ import type {
   PermissionResponse,
   PromaPermissionMode,
   AskUserResponse,
+  PluginRecord,
+  PluginInstallInput,
+  PluginLifecycleInput,
+  PluginStatusInput,
+  PluginStatusResult,
+  PluginOperationResult,
+  PluginInvokeCapabilityInput,
+  PluginInvokeCapabilityResult,
 } from '@proma/shared'
 import type { UserProfile, AppSettings } from '../types'
 import { getRuntimeStatus, getGitRepoStatus } from './lib/runtime-init'
@@ -112,6 +120,16 @@ import {
   setWorkspacePermissionMode,
 } from './lib/agent-workspace-manager'
 import {
+  listPlugins,
+  installPluginFromLocal,
+  enablePlugin,
+  disablePlugin,
+  uninstallPlugin,
+  getPluginStatus,
+  invokePluginCapability,
+  scanInstalledPlugins,
+} from './lib/plugins/runtime'
+import {
   getLatestRelease,
   listReleases as listGitHubReleases,
   getReleaseByTag,
@@ -166,6 +184,71 @@ export function registerIpcHandlers(): void {
         return
       }
       await shell.openExternal(url)
+    }
+  )
+
+  // 预扫描已安装插件并恢复索引状态
+  try {
+    scanInstalledPlugins()
+  } catch (error) {
+    console.error('[插件] 启动扫描失败:', error)
+  }
+
+  // ===== 插件管理相关 =====
+
+  // 获取插件列表
+  ipcMain.handle(
+    PLUGIN_IPC_CHANNELS.LIST,
+    async (): Promise<PluginRecord[]> => {
+      return listPlugins()
+    }
+  )
+
+  // 从本地路径安装插件
+  ipcMain.handle(
+    PLUGIN_IPC_CHANNELS.INSTALL_LOCAL,
+    async (_, input: PluginInstallInput): Promise<PluginOperationResult> => {
+      return installPluginFromLocal(input)
+    }
+  )
+
+  // 启用插件
+  ipcMain.handle(
+    PLUGIN_IPC_CHANNELS.ENABLE,
+    async (_, input: PluginLifecycleInput): Promise<PluginOperationResult> => {
+      return enablePlugin(input)
+    }
+  )
+
+  // 禁用插件
+  ipcMain.handle(
+    PLUGIN_IPC_CHANNELS.DISABLE,
+    async (_, input: PluginLifecycleInput): Promise<PluginOperationResult> => {
+      return disablePlugin(input)
+    }
+  )
+
+  // 卸载插件
+  ipcMain.handle(
+    PLUGIN_IPC_CHANNELS.UNINSTALL,
+    async (_, input: PluginLifecycleInput): Promise<PluginOperationResult> => {
+      return uninstallPlugin(input)
+    }
+  )
+
+  // 获取插件状态
+  ipcMain.handle(
+    PLUGIN_IPC_CHANNELS.GET_STATUS,
+    async (_, input: PluginStatusInput): Promise<PluginStatusResult> => {
+      return getPluginStatus(input)
+    }
+  )
+
+  // 调用插件能力
+  ipcMain.handle(
+    PLUGIN_IPC_CHANNELS.INVOKE_CAPABILITY,
+    async (_, input: PluginInvokeCapabilityInput): Promise<PluginInvokeCapabilityResult> => {
+      return invokePluginCapability(input)
     }
   )
 

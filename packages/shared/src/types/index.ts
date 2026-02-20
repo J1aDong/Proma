@@ -24,6 +24,9 @@ export * from './chat'
 // Agent 相关类型
 export * from './agent'
 
+// 插件系统相关类型
+export * from './plugin'
+
 // 环境检测相关类型
 export * from './environment'
 

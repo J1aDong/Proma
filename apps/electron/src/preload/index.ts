@@ -6,7 +6,7 @@
  */
 
 import { contextBridge, ipcRenderer } from 'electron'
-import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS } from '@proma/shared'
+import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, PLUGIN_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS } from '@proma/shared'
 import { USER_PROFILE_IPC_CHANNELS, SETTINGS_IPC_CHANNELS } from '../types'
 import type {
   RuntimeStatus,
@@ -55,6 +55,14 @@ import type {
   PromaPermissionMode,
   AskUserRequest,
   AskUserResponse,
+  PluginRecord,
+  PluginInstallInput,
+  PluginLifecycleInput,
+  PluginStatusInput,
+  PluginStatusResult,
+  PluginOperationResult,
+  PluginInvokeCapabilityInput,
+  PluginInvokeCapabilityResult,
 } from '@proma/shared'
 import type { UserProfile, AppSettings } from '../types'
 
@@ -226,6 +234,29 @@ export interface ElectronAPI {
 
   /** 订阅流式错误事件 */
   onStreamError: (callback: (event: StreamErrorEvent) => void) => () => void
+
+  // ===== 插件管理相关 =====
+
+  /** 获取插件列表 */
+  listPlugins: () => Promise<PluginRecord[]>
+
+  /** 从本地路径安装插件 */
+  installPluginFromLocal: (input: PluginInstallInput) => Promise<PluginOperationResult>
+
+  /** 启用插件 */
+  enablePlugin: (input: PluginLifecycleInput) => Promise<PluginOperationResult>
+
+  /** 禁用插件 */
+  disablePlugin: (input: PluginLifecycleInput) => Promise<PluginOperationResult>
+
+  /** 卸载插件 */
+  uninstallPlugin: (input: PluginLifecycleInput) => Promise<PluginOperationResult>
+
+  /** 获取插件状态 */
+  getPluginStatus: (input: PluginStatusInput) => Promise<PluginStatusResult>
+
+  /** 调用插件能力 */
+  invokePluginCapability: (input: PluginInvokeCapabilityInput) => Promise<PluginInvokeCapabilityResult>
 
   // ===== Agent 会话管理相关 =====
 
@@ -598,6 +629,35 @@ const electronAPI: ElectronAPI = {
     const listener = (_: unknown, event: StreamErrorEvent): void => callback(event)
     ipcRenderer.on(CHAT_IPC_CHANNELS.STREAM_ERROR, listener)
     return () => { ipcRenderer.removeListener(CHAT_IPC_CHANNELS.STREAM_ERROR, listener) }
+  },
+
+  // ===== 插件管理 =====
+  listPlugins: () => {
+    return ipcRenderer.invoke(PLUGIN_IPC_CHANNELS.LIST)
+  },
+
+  installPluginFromLocal: (input: PluginInstallInput) => {
+    return ipcRenderer.invoke(PLUGIN_IPC_CHANNELS.INSTALL_LOCAL, input)
+  },
+
+  enablePlugin: (input: PluginLifecycleInput) => {
+    return ipcRenderer.invoke(PLUGIN_IPC_CHANNELS.ENABLE, input)
+  },
+
+  disablePlugin: (input: PluginLifecycleInput) => {
+    return ipcRenderer.invoke(PLUGIN_IPC_CHANNELS.DISABLE, input)
+  },
+
+  uninstallPlugin: (input: PluginLifecycleInput) => {
+    return ipcRenderer.invoke(PLUGIN_IPC_CHANNELS.UNINSTALL, input)
+  },
+
+  getPluginStatus: (input: PluginStatusInput) => {
+    return ipcRenderer.invoke(PLUGIN_IPC_CHANNELS.GET_STATUS, input)
+  },
+
+  invokePluginCapability: (input: PluginInvokeCapabilityInput) => {
+    return ipcRenderer.invoke(PLUGIN_IPC_CHANNELS.INVOKE_CAPABILITY, input)
   },
 
   // Agent 会话管理

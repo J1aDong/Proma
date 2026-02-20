@@ -259,6 +259,100 @@ export function getWorkspaceSkillsDir(slug: string): string {
 }
 
 /**
+ * 校验目录片段安全性（避免路径穿越）
+ */
+function assertSafePathSegment(value: string, fieldName: string): void {
+  if (!value || !/^[a-zA-Z0-9._-]+$/.test(value)) {
+    throw new Error(`${fieldName} 包含非法字符: ${value}`)
+  }
+}
+
+/**
+ * 获取插件索引文件路径
+ *
+ * @returns ~/.proma/plugins.json
+ */
+export function getPluginsIndexPath(): string {
+  return join(getConfigDir(), 'plugins.json')
+}
+
+/**
+ * 获取插件安装根目录
+ *
+ * 如果目录不存在则自动创建。
+ *
+ * @returns ~/.proma/plugins/
+ */
+export function getPluginsDir(): string {
+  const dir = join(getConfigDir(), 'plugins')
+
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true })
+    console.log(`[配置] 已创建插件目录: ${dir}`)
+  }
+
+  return dir
+}
+
+/**
+ * 获取单个插件安装目录
+ *
+ * 如果目录不存在则自动创建。
+ *
+ * @param pluginId 插件 ID
+ * @returns ~/.proma/plugins/{pluginId}/
+ */
+export function getPluginInstallPath(pluginId: string): string {
+  assertSafePathSegment(pluginId, 'pluginId')
+  const dir = join(getPluginsDir(), pluginId)
+
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true })
+    console.log(`[配置] 已创建插件安装目录: ${dir}`)
+  }
+
+  return dir
+}
+
+/**
+ * 获取插件工作区根目录
+ *
+ * 如果目录不存在则自动创建。
+ *
+ * @returns ~/.proma/plugin-workspaces/
+ */
+export function getPluginWorkspacesDir(): string {
+  const dir = join(getConfigDir(), 'plugin-workspaces')
+
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true })
+    console.log(`[配置] 已创建插件工作区目录: ${dir}`)
+  }
+
+  return dir
+}
+
+/**
+ * 获取单个插件工作区目录
+ *
+ * 如果目录不存在则自动创建。
+ *
+ * @param pluginId 插件 ID
+ * @returns ~/.proma/plugin-workspaces/{pluginId}/
+ */
+export function getPluginWorkspacePath(pluginId: string): string {
+  assertSafePathSegment(pluginId, 'pluginId')
+  const dir = join(getPluginWorkspacesDir(), pluginId)
+
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true })
+    console.log(`[配置] 已创建插件工作区: ${dir}`)
+  }
+
+  return dir
+}
+
+/**
  * 获取默认 Skills 模板目录路径
  *
  * 新建工作区时自动复制此目录的内容到工作区 skills/ 下。

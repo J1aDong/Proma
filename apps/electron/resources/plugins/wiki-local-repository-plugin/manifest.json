@@ -1,0 +1,25 @@
+{
+  "manifestVersion": 1,
+  "id": "wiki-local-repository-plugin",
+  "name": "本地仓库 Wiki",
+  "version": "0.1.0",
+  "description": "分析本地代码仓库并生成可浏览的 Wiki 内容",
+  "author": "Proma",
+  "entry": {
+    "main": "index.mjs"
+  },
+  "permissions": [
+    "filesystem:read",
+    "filesystem:write"
+  ],
+  "capabilities": [
+    {
+      "key": "wiki:local-repository",
+      "title": "本地仓库 Wiki",
+      "description": "分析本地仓库结构并生成 Wiki 页面",
+      "config": {
+        "version": "v1"
+      }
+    }
+  ]
+}
