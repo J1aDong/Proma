@@ -159,6 +159,7 @@ export function PluginWorkbenchRenderer({
   onInvokeAction,
 }: PluginWorkbenchRendererProps): React.ReactElement {
   const [toolbarInputValuesMap, setToolbarInputValuesMap] = React.useState<ToolbarInputsByNode>({})
+  const [pathImportPendingMap, setPathImportPendingMap] = React.useState<Record<string, boolean>>({})
 
   const updateToolbarInput = React.useCallback((nodeKey: string, inputKey: string, value: unknown): void => {
     setToolbarInputValuesMap((prev) => {
@@ -172,6 +173,35 @@ export function PluginWorkbenchRenderer({
       }
     })
   }, [])
+
+  const importPathToToolbarInput = React.useCallback(async (
+    nodeKey: string,
+    actionId: string,
+    inputKey: string,
+  ): Promise<void> => {
+    const pendingKey = `${nodeKey}:${actionId}:${inputKey}`
+    setPathImportPendingMap((prev) => ({
+      ...prev,
+      [pendingKey]: true,
+    }))
+
+    try {
+      const result = await window.electronAPI.openFolderDialog()
+      if (result?.path) {
+        updateToolbarInput(nodeKey, inputKey, result.path)
+      }
+    } catch {
+      // 选择器调用失败时保持当前输入值，用户仍可手动输入路径
+    } finally {
+      setPathImportPendingMap((prev) => {
+        const next = {
+          ...prev,
+        }
+        delete next[pendingKey]
+        return next
+      })
+    }
+  }, [updateToolbarInput])
 
   const renderToolbarInput = (
     nodeKey: string,
@@ -234,8 +264,39 @@ export function PluginWorkbenchRenderer({
       )
     }
 
+    if (input.type === 'path') {
+      const pendingKey = `${nodeKey}:${action.id}:${input.key}`
+      const isImportPending = pathImportPendingMap[pendingKey] === true
+
+      return (
+        <div key={inputId} className="min-w-[460px] space-y-1.5">
+          {commonHeader}
+          <div className="flex items-center gap-2">
+            <Input
+              id={inputId}
+              type="text"
+              placeholder={input.placeholder}
+              value={toTextValue(currentValue)}
+              onChange={(event) => updateToolbarInput(nodeKey, input.key, event.target.value)}
+            />
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={isImportPending}
+              onClick={() => {
+                void importPathToToolbarInput(nodeKey, action.id, input.key)
+              }}
+            >
+              {isImportPending ? '导入中...' : '导入(路径)'}
+            </Button>
+          </div>
+        </div>
+      )
+    }
+
     return (
-      <div key={inputId} className="min-w-[280px] space-y-1.5">
+      <div key={inputId} className="min-w-[360px] space-y-1.5">
         {commonHeader}
         <Input
           id={inputId}
