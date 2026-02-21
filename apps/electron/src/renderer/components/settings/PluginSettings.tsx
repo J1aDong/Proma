@@ -2,6 +2,7 @@
  * PluginSettings - 插件管理页
  *
  * 支持本地路径安装、启用/禁用、卸载与能力调用测试。
+ * 插件实际功能统一在主界面 Plugin 模式中使用。
  */
 
 import * as React from 'react'
@@ -9,7 +10,6 @@ import { useAtomValue, useSetAtom } from 'jotai'
 import { FolderOpen, Loader2, Plug, Power, Trash2, Wrench } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { ScrollArea } from '@/components/ui/scroll-area'
 import type { PluginRecord } from '@proma/shared'
 import {
   pluginListAtom,
@@ -24,44 +24,6 @@ import {
   invokePluginCapabilityAtom,
 } from '@/atoms/plugin-atoms'
 import { SettingsCard, SettingsRow, SettingsSection } from './primitives'
-
-const WIKI_PLUGIN_ID = 'wiki-local-repository-plugin'
-const WIKI_CAPABILITY_KEY = 'wiki:local-repository'
-
-interface WikiReport {
-  rootPath: string
-  generatedAt: string
-  stats: {
-    directories: number
-    files: number
-    codeFiles: number
-  }
-  topLevelEntries: Array<{ name: string; type: 'dir' | 'file' }>
-  sampleCodeFiles: string[]
-  keyFiles: Array<{ path: string; preview: string }>
-  markdown: string
-}
-
-interface WikiCapabilityResponse {
-  success?: boolean
-  action?: string
-  report?: WikiReport
-}
-
-function parseWikiReport(data: unknown): WikiReport | null {
-  if (!data || typeof data !== 'object') return null
-
-  const payload = data as WikiCapabilityResponse
-  if (!payload.report || typeof payload.report !== 'object') return null
-
-  const report = payload.report
-  if (typeof report.rootPath !== 'string') return null
-  if (typeof report.generatedAt !== 'string') return null
-  if (!report.stats || typeof report.stats !== 'object') return null
-  if (typeof report.markdown !== 'string') return null
-
-  return report
-}
 
 export function PluginSettings(): React.ReactElement {
   const plugins = useAtomValue(pluginListAtom)
@@ -79,18 +41,6 @@ export function PluginSettings(): React.ReactElement {
   const [installPath, setInstallPath] = React.useState('')
   const [invokingPluginId, setInvokingPluginId] = React.useState<string | null>(null)
 
-  const [wikiRepoPath, setWikiRepoPath] = React.useState('')
-  const [wikiBusy, setWikiBusy] = React.useState(false)
-  const [wikiError, setWikiError] = React.useState<string | null>(null)
-  const [wikiReport, setWikiReport] = React.useState<WikiReport | null>(null)
-
-  const wikiPlugin = React.useMemo(
-    () => plugins.find((plugin) => plugin.id === WIKI_PLUGIN_ID) ?? null,
-    [plugins],
-  )
-  const wikiPluginActive = wikiPlugin?.state === 'active'
-  const wikiPluginPending = wikiPlugin ? pendingMap[wikiPlugin.id] === true : false
-
   React.useEffect(() => {
     void loadPlugins()
   }, [loadPlugins])
@@ -99,12 +49,6 @@ export function PluginSettings(): React.ReactElement {
     const folder = await window.electronAPI.openFolderDialog()
     if (!folder) return
     setInstallPath(folder.path)
-  }
-
-  const handlePickWikiRepo = async (): Promise<void> => {
-    const folder = await window.electronAPI.openFolderDialog()
-    if (!folder) return
-    setWikiRepoPath(folder.path)
   }
 
   const handleInstall = async (): Promise<void> => {
@@ -140,74 +84,6 @@ export function PluginSettings(): React.ReactElement {
       })
     } finally {
       setInvokingPluginId(null)
-    }
-  }
-
-  const handleGenerateWiki = async (): Promise<void> => {
-    if (!wikiPlugin || !wikiPluginActive || !wikiRepoPath.trim()) return
-
-    setWikiBusy(true)
-    setWikiError(null)
-
-    try {
-      const result = await invokeCapability({
-        pluginId: wikiPlugin.id,
-        capabilityKey: WIKI_CAPABILITY_KEY,
-        payload: {
-          action: 'analyze',
-          repoPath: wikiRepoPath.trim(),
-        },
-      })
-
-      if (!result.success) {
-        setWikiError(result.error ?? 'Wiki 生成失败')
-        return
-      }
-
-      const report = parseWikiReport(result.data)
-      if (!report) {
-        setWikiError('Wiki 结果格式无效')
-        return
-      }
-
-      setWikiReport(report)
-    } finally {
-      setWikiBusy(false)
-    }
-  }
-
-  const handleLoadLatestWiki = async (): Promise<void> => {
-    if (!wikiPlugin || !wikiPluginActive) return
-
-    setWikiBusy(true)
-    setWikiError(null)
-
-    try {
-      const result = await invokeCapability({
-        pluginId: wikiPlugin.id,
-        capabilityKey: WIKI_CAPABILITY_KEY,
-        payload: { action: 'get-latest' },
-      })
-
-      if (!result.success) {
-        const normalizedError = (result.error ?? '').toLowerCase()
-        if (normalizedError.includes('enoent') || normalizedError.includes('no such file')) {
-          setWikiError('尚未生成 Wiki，请先执行“分析并生成”')
-          return
-        }
-        setWikiError(result.error ?? '读取 Wiki 失败')
-        return
-      }
-
-      const report = parseWikiReport(result.data)
-      if (!report) {
-        setWikiError('Wiki 结果格式无效')
-        return
-      }
-
-      setWikiReport(report)
-    } finally {
-      setWikiBusy(false)
     }
   }
 
@@ -308,94 +184,15 @@ export function PluginSettings(): React.ReactElement {
       </SettingsSection>
 
       <SettingsSection
-        title="Wiki 插件（本地仓库）"
-        description="通过插件能力分析本地代码仓库并生成可浏览的 Wiki 内容"
+        title="功能使用入口"
+        description="插件实际功能统一在主界面 Plugin 模式中使用"
       >
         <SettingsCard divided={false}>
-          <div className="p-4 space-y-4">
-            {!wikiPlugin && (
-              <p className="text-sm text-muted-foreground">
-                未检测到 Wiki 插件，请先在上方安装内置目录插件。
-              </p>
-            )}
-
-            {wikiPlugin && (
-              <>
-                <div className="flex items-center gap-2 text-sm">
-                  <span className="text-muted-foreground">状态：</span>
-                  <span className={wikiPluginActive ? 'text-emerald-600' : 'text-muted-foreground'}>
-                    {wikiPlugin.state}
-                  </span>
-                  {!wikiPluginActive && (
-                    <span className="text-muted-foreground">（插件未启用，Wiki 入口已禁用）</span>
-                  )}
-                </div>
-
-                <div className="flex gap-2">
-                  <Input
-                    value={wikiRepoPath}
-                    onChange={(event) => setWikiRepoPath(event.target.value)}
-                    placeholder="选择本地代码仓库路径"
-                    disabled={!wikiPluginActive || wikiBusy || wikiPluginPending}
-                  />
-                  <Button
-                    variant="outline"
-                    onClick={() => void handlePickWikiRepo()}
-                    disabled={!wikiPluginActive || wikiBusy || wikiPluginPending}
-                  >
-                    <FolderOpen size={14} />
-                    <span>选择仓库</span>
-                  </Button>
-                  <Button
-                    onClick={() => void handleGenerateWiki()}
-                    disabled={!wikiPluginActive || !wikiRepoPath.trim() || wikiBusy || wikiPluginPending}
-                  >
-                    {wikiBusy ? <Loader2 size={14} className="animate-spin" /> : <Plug size={14} />}
-                    <span>分析并生成</span>
-                  </Button>
-                  <Button
-                    variant="outline"
-                    onClick={() => void handleLoadLatestWiki()}
-                    disabled={!wikiPluginActive || wikiBusy || wikiPluginPending}
-                  >
-                    <span>读取最新</span>
-                  </Button>
-                </div>
-
-                {wikiError && (
-                  <p className="text-sm text-destructive">{wikiError}</p>
-                )}
-
-                {wikiReport && (
-                  <div className="space-y-3">
-                    <div className="grid grid-cols-3 gap-3 text-sm">
-                      <div className="rounded-md bg-muted/40 px-3 py-2">
-                        <div className="text-xs text-muted-foreground">目录</div>
-                        <div className="font-medium">{wikiReport.stats.directories}</div>
-                      </div>
-                      <div className="rounded-md bg-muted/40 px-3 py-2">
-                        <div className="text-xs text-muted-foreground">文件</div>
-                        <div className="font-medium">{wikiReport.stats.files}</div>
-                      </div>
-                      <div className="rounded-md bg-muted/40 px-3 py-2">
-                        <div className="text-xs text-muted-foreground">代码文件</div>
-                        <div className="font-medium">{wikiReport.stats.codeFiles}</div>
-                      </div>
-                    </div>
-
-                    <p className="text-xs text-muted-foreground">
-                      仓库：{wikiReport.rootPath}
-                    </p>
-
-                    <ScrollArea className="h-[260px] rounded-md border border-border/60 bg-muted/15">
-                      <pre className="p-3 text-xs leading-relaxed whitespace-pre-wrap break-words">
-                        {wikiReport.markdown}
-                      </pre>
-                    </ScrollArea>
-                  </div>
-                )}
-              </>
-            )}
+          <div className="p-4 space-y-2 text-sm text-muted-foreground">
+            <p>1. 切换到主界面 Plugin 模式。</p>
+            <p>2. 在左侧插件列表选择目标插件。</p>
+            <p>3. 在右侧工作台执行插件动作并查看结果。</p>
+            <p>若插件不可用，请先在本页完成启用。</p>
           </div>
         </SettingsCard>
       </SettingsSection>

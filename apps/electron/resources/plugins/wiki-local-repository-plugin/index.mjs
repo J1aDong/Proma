@@ -8,6 +8,50 @@ let runtimeContext = null
 /** @type {(() => void) | null} */
 let abortListener = null
 
+const CAPABILITY_KEY = 'wiki:local-repository'
+const LATEST_JSON_PATH = 'wiki/latest.json'
+const LATEST_MD_PATH = 'wiki/latest.md'
+
+const WORKBENCH_ERROR_CODE = {
+  pluginNotActive: 'PLUGIN_NOT_ACTIVE',
+  hookFailed: 'WORKBENCH_HOOK_FAILED',
+  actionInvalid: 'WORKBENCH_ACTION_INVALID',
+}
+
+const WORKBENCH_ACTION_ID = {
+  analyze: 'analyze',
+  getLatest: 'get-latest',
+}
+
+/**
+ * @param {string} code
+ * @param {string} message
+ */
+function createWorkbenchError(code, message) {
+  return {
+    success: false,
+    error: {
+      code,
+      message,
+    },
+  }
+}
+
+/**
+ * @param {string} filePath
+ * @returns {Promise<string | null>}
+ */
+async function readWorkspaceFileIfExists(filePath) {
+  if (!runtimeContext) {
+    return null
+  }
+
+  try {
+    return await runtimeContext.api.workbench.readFile(filePath)
+  } catch {
+    return null
+  }
+}
 /**
  * @typedef {{
  *   rootPath: string
@@ -80,16 +124,12 @@ export async function deactivate() {
  * @param {Record<string, unknown> | undefined} payload
  * @returns {Promise<unknown>}
  */
-export async function invokeCapability(capabilityKey, payload) {
+async function runCapabilityAction(payload) {
   if (!runtimeContext) {
     throw new Error('插件尚未激活')
   }
 
-  if (capabilityKey !== 'wiki:local-repository') {
-    throw new Error(`不支持的 capability: ${capabilityKey}`)
-  }
-
-  const action = typeof payload?.action === 'string' ? payload.action : 'analyze'
+  const action = typeof payload?.action === 'string' ? payload.action : WORKBENCH_ACTION_ID.analyze
 
   if (action === 'ping') {
     return {
@@ -100,7 +140,7 @@ export async function invokeCapability(capabilityKey, payload) {
     }
   }
 
-  if (action === 'analyze') {
+  if (action === WORKBENCH_ACTION_ID.analyze) {
     runtimeContext.lifecycle.throwIfAborted()
 
     const repoPath = normalizeRepoPath(payload)
@@ -108,28 +148,158 @@ export async function invokeCapability(capabilityKey, payload) {
 
     runtimeContext.lifecycle.throwIfAborted()
 
-    await runtimeContext.api.fs.writeText('wiki/latest.json', JSON.stringify(report, null, 2))
-    await runtimeContext.api.fs.writeText('wiki/latest.md', report.markdown)
+    await runtimeContext.api.fs.writeText(LATEST_JSON_PATH, JSON.stringify(report, null, 2))
+    await runtimeContext.api.fs.writeText(LATEST_MD_PATH, report.markdown)
 
     return {
       success: true,
-      action: 'analyze',
+      action: WORKBENCH_ACTION_ID.analyze,
       report,
     }
   }
 
-  if (action === 'get-latest') {
+  if (action === WORKBENCH_ACTION_ID.getLatest) {
     runtimeContext.lifecycle.throwIfAborted()
 
-    const stored = await runtimeContext.api.fs.readText('wiki/latest.json')
+    const stored = await runtimeContext.api.fs.readText(LATEST_JSON_PATH)
     return {
       success: true,
-      action: 'get-latest',
+      action: WORKBENCH_ACTION_ID.getLatest,
       report: JSON.parse(stored),
     }
   }
 
   throw new Error(`不支持的 action: ${action}`)
+}
+
+/**
+ * 插件能力调用入口
+ * @param {string} capabilityKey
+ * @param {Record<string, unknown> | undefined} payload
+ * @returns {Promise<unknown>}
+ */
+export async function invokeCapability(capabilityKey, payload) {
+  if (!runtimeContext) {
+    throw new Error('插件尚未激活')
+  }
+
+  if (capabilityKey !== CAPABILITY_KEY) {
+    throw new Error(`不支持的 capability: ${capabilityKey}`)
+  }
+
+  return runCapabilityAction(payload)
+}
+
+/**
+ * 插件工作台画布入口
+ * @returns {Promise<import('@proma/shared').PluginWorkbenchResponse<import('@proma/shared').PluginWorkbenchCanvas>>}
+ */
+export async function getWorkbenchCanvas() {
+  if (!runtimeContext) {
+    return createWorkbenchError(WORKBENCH_ERROR_CODE.pluginNotActive, '插件尚未激活')
+  }
+
+  try {
+    const latestMarkdown = await readWorkspaceFileIfExists(LATEST_MD_PATH)
+
+    return {
+      success: true,
+      data: {
+        version: 1,
+        root: {
+          id: 'wiki-root',
+          type: 'page',
+          title: '本地仓库 Wiki 工作台',
+          description: '先分析仓库，再查看最新 Markdown 结果。',
+          children: [
+            {
+              id: 'wiki-toolbar',
+              type: 'toolbar',
+              title: '操作',
+              actions: [
+                {
+                  id: WORKBENCH_ACTION_ID.analyze,
+                  label: '分析仓库',
+                  description: '扫描本地仓库并生成 wiki/latest.md',
+                  variant: 'primary',
+                  payload: {
+                    action: WORKBENCH_ACTION_ID.analyze,
+                    repoPath: '',
+                  },
+                  inputs: [
+                    {
+                      key: 'repoPath',
+                      label: '仓库路径',
+                      type: 'path',
+                      required: true,
+                      placeholder: '请输入本地仓库绝对路径，例如 /Users/me/project',
+                    },
+                  ],
+                },
+                {
+                  id: WORKBENCH_ACTION_ID.getLatest,
+                  label: '读取最新结果',
+                  variant: 'secondary',
+                  payload: {
+                    action: WORKBENCH_ACTION_ID.getLatest,
+                  },
+                },
+              ],
+            },
+            {
+              id: 'wiki-markdown',
+              type: 'markdown',
+              title: '最新 Wiki Markdown',
+              sourcePath: LATEST_MD_PATH,
+              content: latestMarkdown ?? '',
+              emptyText: '还没有分析结果，请先执行「分析仓库」。',
+            },
+          ],
+        },
+      },
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    return createWorkbenchError(WORKBENCH_ERROR_CODE.hookFailed, message)
+  }
+}
+
+/**
+ * 插件工作台动作入口
+ * @param {import('@proma/shared').PluginWorkbenchActionTrigger} action
+ * @returns {Promise<import('@proma/shared').PluginWorkbenchResponse<import('@proma/shared').PluginWorkbenchActionResult>>}
+ */
+export async function invokeWorkbenchAction(action) {
+  if (!runtimeContext) {
+    return createWorkbenchError(WORKBENCH_ERROR_CODE.pluginNotActive, '插件尚未激活')
+  }
+
+  const actionId = action?.actionId
+  if (actionId !== WORKBENCH_ACTION_ID.analyze && actionId !== WORKBENCH_ACTION_ID.getLatest) {
+    return createWorkbenchError(WORKBENCH_ERROR_CODE.actionInvalid, `不支持的工作台动作: ${String(actionId)}`)
+  }
+
+  try {
+    const payload = {
+      ...(action?.payload ?? {}),
+      action: actionId,
+    }
+
+    const result = await runCapabilityAction(payload)
+
+    return {
+      success: true,
+      data: {
+        type: 'toast',
+        level: 'success',
+        message: actionId === WORKBENCH_ACTION_ID.analyze ? '仓库分析完成，已生成最新 Markdown。' : '已读取最新分析结果。',
+        data: result,
+      },
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    return createWorkbenchError(WORKBENCH_ERROR_CODE.hookFailed, message)
+  }
 }
 
 /**

@@ -2,15 +2,28 @@
  * LeftSidebar - 左侧导航栏
  *
  * 包含：
- * - Chat/Agent 模式切换器
+ * - Chat/Agent/Plugin 模式切换器
  * - 导航菜单项（点击切换主内容区视图）
  * - 置顶对话区域（可展开/收起）
  * - 对话列表（新对话按钮 + 右键菜单 + 按 updatedAt 降序排列）
  */
 
 import * as React from 'react'
-import { useAtom, useSetAtom, useAtomValue } from 'jotai'
-import { Pin, PinOff, Settings, Plus, Trash2, Pencil, ChevronDown, ChevronRight, Plug, Zap } from 'lucide-react'
+import { useAtom, useAtomValue, useSetAtom } from 'jotai'
+import {
+  ChevronDown,
+  ChevronRight,
+  LayoutGrid,
+  Pencil,
+  Pin,
+  PinOff,
+  Plug,
+  Plus,
+  RefreshCw,
+  Settings,
+  Trash2,
+  Zap,
+} from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { ModeSwitcher } from './ModeSwitcher'
 import { activeViewAtom } from '@/atoms/active-view'
@@ -31,6 +44,14 @@ import {
   agentWorkspacesAtom,
   workspaceCapabilitiesVersionAtom,
 } from '@/atoms/agent-atoms'
+import {
+  loadPluginWorkbenchListAtom,
+  pluginWorkbenchListAtom,
+  pluginWorkbenchListErrorAtom,
+  pluginWorkbenchListLoadingAtom,
+  selectPluginWorkbenchAtom,
+  selectedPluginWorkbenchIdAtom,
+} from '@/atoms'
 import { userProfileAtom } from '@/atoms/user-profile'
 import { hasUpdateAtom } from '@/atoms/updater'
 import { hasEnvironmentIssuesAtom } from '@/atoms/environment'
@@ -143,9 +164,17 @@ export function LeftSidebar({ width }: LeftSidebarProps): React.ReactElement {
   const setUserProfile = useSetAtom(userProfileAtom)
   const selectedModel = useAtomValue(selectedModelAtom)
   const streamingIds = useAtomValue(streamingConversationIdsAtom)
-  const mode = useAtomValue(appModeAtom)
+  const [mode, setMode] = useAtom(appModeAtom)
   const hasUpdate = useAtomValue(hasUpdateAtom)
   const hasEnvironmentIssues = useAtomValue(hasEnvironmentIssuesAtom)
+
+  // Plugin 模式状态
+  const pluginWorkbenchList = useAtomValue(pluginWorkbenchListAtom)
+  const pluginWorkbenchListLoading = useAtomValue(pluginWorkbenchListLoadingAtom)
+  const pluginWorkbenchListError = useAtomValue(pluginWorkbenchListErrorAtom)
+  const selectedPluginWorkbenchId = useAtomValue(selectedPluginWorkbenchIdAtom)
+  const loadPluginWorkbenchList = useSetAtom(loadPluginWorkbenchListAtom)
+  const selectPluginWorkbench = useSetAtom(selectPluginWorkbenchAtom)
 
   // Agent 模式状态
   const [agentSessions, setAgentSessions] = useAtom(agentSessionsAtom)
@@ -174,6 +203,13 @@ export function LeftSidebar({ width }: LeftSidebarProps): React.ReactElement {
       .then(setCapabilities)
       .catch(console.error)
   }, [currentWorkspaceSlug, mode, activeView, capabilitiesVersion])
+
+  React.useEffect(() => {
+    if (mode !== 'plugin') {
+      return
+    }
+    void loadPluginWorkbenchList()
+  }, [mode, loadPluginWorkbenchList])
 
   /** 置顶对话列表 */
   const pinnedConversations = React.useMemo(
@@ -381,16 +417,18 @@ export function LeftSidebar({ width }: LeftSidebarProps): React.ReactElement {
         </div>
       )}
 
-      {/* 新对话/新会话按钮 */}
-      <div className="px-3 pt-2">
-        <button
-          onClick={mode === 'agent' ? handleNewAgentSession : handleNewConversation}
-          className="w-full flex items-center gap-2 px-3 py-2 rounded-[10px] text-[13px] font-medium text-foreground/70 bg-foreground/[0.04] hover:bg-foreground/[0.08] transition-colors duration-100 titlebar-no-drag border border-dashed border-foreground/10 hover:border-foreground/20"
-        >
-          <Plus size={14} />
-          <span>{mode === 'agent' ? '新会话' : '新对话'}</span>
-        </button>
-      </div>
+      {/* 新对话/新会话按钮（Plugin 模式不显示） */}
+      {mode !== 'plugin' && (
+        <div className="px-3 pt-2">
+          <button
+            onClick={mode === 'agent' ? handleNewAgentSession : handleNewConversation}
+            className="w-full flex items-center gap-2 px-3 py-2 rounded-[10px] text-[13px] font-medium text-foreground/70 bg-foreground/[0.04] hover:bg-foreground/[0.08] transition-colors duration-100 titlebar-no-drag border border-dashed border-foreground/10 hover:border-foreground/20"
+          >
+            <Plus size={14} />
+            <span>{mode === 'agent' ? '新会话' : '新对话'}</span>
+          </button>
+        </div>
+      )}
 
       {/* Chat 模式：导航菜单（置顶区域） */}
       {mode === 'chat' && (
@@ -463,7 +501,7 @@ export function LeftSidebar({ width }: LeftSidebarProps): React.ReactElement {
               </div>
             </div>
           ))
-        ) : (
+        ) : mode === 'agent' ? (
           /* Agent 模式：Agent 会话按日期分组 */
           agentSessionGroups.map((group) => (
             <div key={group.label} className="mb-1">
@@ -488,6 +526,79 @@ export function LeftSidebar({ width }: LeftSidebarProps): React.ReactElement {
               </div>
             </div>
           ))
+        ) : (
+          /* Plugin 模式：插件工作台列表 */
+          <div className="min-h-0">
+            <div className="px-3 pb-2 flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 min-w-0">
+                <LayoutGrid className="size-4 text-muted-foreground" />
+                <h2 className="text-sm font-semibold truncate">插件工作台</h2>
+              </div>
+              <button
+                onClick={() => { void loadPluginWorkbenchList() }}
+                className="p-1.5 rounded-md text-foreground/50 hover:text-foreground hover:bg-foreground/[0.06] transition-colors"
+                title="刷新插件列表"
+              >
+                <RefreshCw className="size-3.5" />
+              </button>
+            </div>
+
+            {pluginWorkbenchListLoading && pluginWorkbenchList.length === 0 ? (
+              <div className="px-3 pt-2 text-[12px] text-foreground/45">正在加载插件工作台列表...</div>
+            ) : pluginWorkbenchListError && pluginWorkbenchList.length === 0 ? (
+              <div className="px-3 pt-2 space-y-2">
+                <p className="text-[12px] text-destructive/90 leading-5">{pluginWorkbenchListError}</p>
+                <button
+                  onClick={() => { void loadPluginWorkbenchList() }}
+                  className="text-[12px] px-2 py-1 rounded-md border border-border/70 hover:bg-foreground/[0.04]"
+                >
+                  重试
+                </button>
+              </div>
+            ) : pluginWorkbenchList.length === 0 ? (
+              <div className="px-3 pt-2 text-[12px] text-foreground/45 leading-5">
+                暂无可用插件，请先到设置页安装并启用插件。
+              </div>
+            ) : (
+              <div className="flex flex-col gap-1 px-1 pb-1">
+                {pluginWorkbenchList.map((item) => {
+                  const active = item.pluginId === selectedPluginWorkbenchId
+                  return (
+                    <button
+                      key={item.pluginId}
+                      onClick={() => {
+                        selectPluginWorkbench(item.pluginId)
+                        setMode('plugin')
+                        setActiveView('conversations')
+                        setActiveItem('all-chats')
+                      }}
+                      className={cn(
+                        'w-full text-left rounded-[10px] px-3 py-2 border transition-colors',
+                        active
+                          ? 'bg-foreground/[0.08] dark:bg-foreground/[0.08] border-primary/30 shadow-[0_1px_2px_0_rgba(0,0,0,0.05)]'
+                          : 'bg-transparent border-transparent hover:bg-foreground/[0.04] hover:border-border/60',
+                      )}
+                    >
+                      <div className="flex items-start gap-2">
+                        <Plug className="size-4 mt-0.5 text-muted-foreground shrink-0" />
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-1.5">
+                            <p className="text-[13px] font-medium truncate">{item.name}</p>
+                            <span className="text-[10px] px-1.5 py-0.5 rounded border border-border/70 text-foreground/55">
+                              {item.state}
+                            </span>
+                          </div>
+                          {item.description && (
+                            <p className="text-[11px] text-foreground/50 line-clamp-2 mt-0.5">{item.description}</p>
+                          )}
+                        </div>
+                      </div>
+                    </button>
+                  )
+                })}
+              </div>
+            )}
+          </div>
         )}
       </div>
 

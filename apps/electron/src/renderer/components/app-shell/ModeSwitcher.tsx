@@ -1,5 +1,5 @@
 /**
- * ModeSwitcher - Chat/Agent 模式切换（带滑动指示器）
+ * ModeSwitcher - Chat/Agent/Plugin 模式切换（带滑动指示器）
  */
 
 import * as React from 'react'
@@ -10,10 +10,17 @@ import { cn } from '@/lib/utils'
 const modes: { value: AppMode; label: string }[] = [
   { value: 'chat', label: 'Chat' },
   { value: 'agent', label: 'Agent' },
+  { value: 'plugin', label: 'Plugin' },
 ]
 
 export function ModeSwitcher(): React.ReactElement {
   const [mode, setMode] = useAtom(appModeAtom)
+
+  const modeIndex = Math.max(0, modes.findIndex((item) => item.value === mode))
+  const indicatorStyle: React.CSSProperties = {
+    width: `calc((100% - 8px) / ${modes.length})`,
+    transform: `translateX(calc(${modeIndex} * 100%))`,
+  }
 
   return (
     <div className="px-2 pt-2">
@@ -21,9 +28,9 @@ export function ModeSwitcher(): React.ReactElement {
         {/* 滑动背景指示器 */}
         <div
           className={cn(
-            'absolute top-1 bottom-1 w-[calc(50%-4px)] rounded bg-background shadow-sm transition-transform duration-300 ease-in-out',
-            mode === 'chat' ? 'translate-x-0' : 'translate-x-full'
+            'absolute top-1 bottom-1 left-1 rounded bg-background shadow-sm transition-transform duration-300 ease-in-out'
           )}
+          style={indicatorStyle}
         />
         {modes.map(({ value, label }) => (
           <button

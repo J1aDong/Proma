@@ -68,6 +68,11 @@ export interface PluginManifest {
   permissions: PluginPermission[]
   /** 能力声明 */
   capabilities: PluginCapability[]
+  /** 工作台能力声明（可选） */
+  workbench?: {
+    /** 是否声明画布钩子 */
+    canvasHook?: boolean
+  }
   /** 宿主兼容信息 */
   compatibility?: PluginCompatibility
 }
@@ -151,6 +156,228 @@ export interface PluginOperationResult {
   plugin?: PluginRecord
 }
 
+/** 工作台分栏方向 */
+export type PluginWorkbenchSplitDirection = 'horizontal' | 'vertical'
+
+/** 工作台动作按钮视觉样式 */
+export type PluginWorkbenchActionVariant = 'primary' | 'secondary' | 'ghost' | 'danger'
+
+/** 工作台组件类型 */
+export type PluginWorkbenchNodeType =
+  | 'page'
+  | 'panel'
+  | 'split'
+  | 'card'
+  | 'toolbar'
+  | 'markdown'
+
+/** 工作台动作输入类型 */
+export type PluginWorkbenchActionInputType = 'text' | 'textarea' | 'number' | 'boolean' | 'select' | 'path'
+
+/** 工作台动作输入选项（select 类型） */
+export interface PluginWorkbenchActionInputOption {
+  label: string
+  value: string
+}
+
+/** 工作台动作输入定义 */
+export interface PluginWorkbenchActionInputDefinition {
+  /** 字段键（会写入 payload） */
+  key: string
+  /** 字段标签 */
+  label: string
+  /** 输入类型 */
+  type: PluginWorkbenchActionInputType
+  /** 字段说明 */
+  description?: string
+  /** 占位提示 */
+  placeholder?: string
+  /** 是否必填 */
+  required?: boolean
+  /** 默认值 */
+  defaultValue?: string | number | boolean
+  /** select 可选项 */
+  options?: PluginWorkbenchActionInputOption[]
+  /** number 最小值 */
+  min?: number
+  /** number 最大值 */
+  max?: number
+  /** number 步长 */
+  step?: number
+}
+
+/** 工作台动作定义（用于声明式 UI 交互） */
+export interface PluginWorkbenchActionDefinition {
+  /** 动作唯一标识 */
+  id: string
+  /** 动作显示名称 */
+  label: string
+  /** 动作描述 */
+  description?: string
+  /** 动作样式 */
+  variant?: PluginWorkbenchActionVariant
+  /** 是否禁用 */
+  disabled?: boolean
+  /** 触发动作时携带的默认参数 */
+  payload?: Record<string, unknown>
+  /** 动作输入定义（由宿主渲染通用输入控件） */
+  inputs?: PluginWorkbenchActionInputDefinition[]
+}
+
+/** 工作台节点基础结构 */
+export interface PluginWorkbenchBaseNode {
+  /** 节点类型 */
+  type: PluginWorkbenchNodeType
+  /** 节点唯一标识（可选） */
+  id?: string
+  /** 节点标题 */
+  title?: string
+  /** 节点描述 */
+  description?: string
+}
+
+/** 页面容器节点 */
+export interface PluginWorkbenchPageNode extends PluginWorkbenchBaseNode {
+  type: 'page'
+  children: PluginWorkbenchNode[]
+}
+
+/** 面板容器节点 */
+export interface PluginWorkbenchPanelNode extends PluginWorkbenchBaseNode {
+  type: 'panel'
+  children: PluginWorkbenchNode[]
+}
+
+/** 分栏节点 */
+export interface PluginWorkbenchSplitNode extends PluginWorkbenchBaseNode {
+  type: 'split'
+  direction: PluginWorkbenchSplitDirection
+  /** 子节点比例，按 children 顺序对应 */
+  ratios?: number[]
+  children: PluginWorkbenchNode[]
+}
+
+/** 卡片节点 */
+export interface PluginWorkbenchCardNode extends PluginWorkbenchBaseNode {
+  type: 'card'
+  children?: PluginWorkbenchNode[]
+}
+
+/** 工具栏节点 */
+export interface PluginWorkbenchToolbarNode extends PluginWorkbenchBaseNode {
+  type: 'toolbar'
+  actions: PluginWorkbenchActionDefinition[]
+}
+
+/** Markdown 展示节点 */
+export interface PluginWorkbenchMarkdownNode extends PluginWorkbenchBaseNode {
+  type: 'markdown'
+  /** 直接渲染的 markdown 文本 */
+  content?: string
+  /** 从插件工作区读取的 markdown 文件路径 */
+  sourcePath?: string
+  /** 当内容为空时的提示文案 */
+  emptyText?: string
+}
+
+/** 声明式画布组件树 */
+export type PluginWorkbenchNode =
+  | PluginWorkbenchPageNode
+  | PluginWorkbenchPanelNode
+  | PluginWorkbenchSplitNode
+  | PluginWorkbenchCardNode
+  | PluginWorkbenchToolbarNode
+  | PluginWorkbenchMarkdownNode
+
+/** 插件工作台画布结构 */
+export interface PluginWorkbenchCanvas {
+  /** 画布协议版本 */
+  version: 1
+  /** 画布标题 */
+  title?: string
+  /** 画布描述 */
+  description?: string
+  /** 声明式组件树根节点 */
+  root: PluginWorkbenchNode
+}
+
+/** 工作台动作触发请求（由宿主发起） */
+export interface PluginWorkbenchActionTrigger {
+  /** 触发动作 ID */
+  actionId: string
+  /** 来源节点 ID（可选） */
+  sourceNodeId?: string
+  /** 动作参数 */
+  payload?: Record<string, unknown>
+}
+
+/** 获取插件工作台画布时的请求参数 */
+export interface PluginWorkbenchCanvasRequest {
+  /** 请求原因，便于插件区分首屏和刷新 */
+  reason?: 'initial' | 'refresh'
+  /** 扩展上下文 */
+  context?: Record<string, unknown>
+}
+
+/** 工作台错误码 */
+export type PluginWorkbenchErrorCode =
+  | 'PLUGIN_NOT_FOUND'
+  | 'PLUGIN_NOT_ACTIVE'
+  | 'WORKBENCH_HOOK_NOT_IMPLEMENTED'
+  | 'WORKBENCH_CANVAS_INVALID'
+  | 'WORKBENCH_ACTION_INVALID'
+  | 'WORKBENCH_HOOK_FAILED'
+  | 'WORKBENCH_ACTION_FAILED'
+
+/** 工作台统一错误结构 */
+export interface PluginWorkbenchError {
+  code: PluginWorkbenchErrorCode | (string & {})
+  message: string
+}
+
+/** 工作台统一响应结构 */
+export interface PluginWorkbenchResponse<T = unknown> {
+  success: boolean
+  data?: T
+  error?: PluginWorkbenchError
+}
+
+/** 工作台列表项 */
+export interface PluginWorkbenchListItem {
+  pluginId: string
+  name: string
+  description?: string
+  state: PluginLifecycleState
+  hasCanvasHook: boolean
+}
+
+/** 工作台列表请求 */
+export interface PluginWorkbenchListInput {
+  /** 是否包含未启用插件，默认 true */
+  includeInactive?: boolean
+}
+
+/** 工作台列表响应 */
+export type PluginWorkbenchListResult = PluginWorkbenchResponse<PluginWorkbenchListItem[]>
+
+/** 获取工作台画布请求 */
+export interface PluginGetWorkbenchCanvasInput {
+  pluginId: string
+  request?: PluginWorkbenchCanvasRequest
+}
+
+/** 获取工作台画布响应 */
+export type PluginWorkbenchCanvasResult = PluginWorkbenchResponse<PluginWorkbenchCanvas>
+
+/** 调用工作台动作请求 */
+export interface PluginInvokeWorkbenchActionInput {
+  pluginId: string
+  action: PluginWorkbenchActionTrigger
+}
+
+/** 调用工作台动作响应 */
+export type PluginWorkbenchActionInvokeResult = PluginWorkbenchResponse<unknown>
+
 /**
  * 插件运行时生命周期能力
  *
@@ -187,6 +414,14 @@ export interface PluginRuntimeContext {
     events: {
       emit: (event: string, payload?: Record<string, unknown>) => void
     }
+    workbench: {
+      /** 从插件工作区读取文本文件 */
+      readFile: (path: string) => Promise<string>
+      /** 调用插件自身已声明 capability */
+      invokeCapability: (capabilityKey: string, payload?: Record<string, unknown>) => Promise<unknown>
+      /** 调用插件工作台动作钩子 */
+      invokeAction: (action: PluginWorkbenchActionTrigger) => Promise<PluginWorkbenchActionInvokeResult>
+    }
   }
 }
 
@@ -198,6 +433,25 @@ export interface PluginModule {
     capabilityKey: string,
     payload?: Record<string, unknown>,
   ) => Promise<unknown> | unknown
+  /**
+   * 获取插件工作台声明式画布
+   *
+   * 允许直接返回画布对象，或返回统一响应结构。
+   */
+  getWorkbenchCanvas?: (
+    request?: PluginWorkbenchCanvasRequest,
+  ) =>
+    | Promise<PluginWorkbenchCanvas | PluginWorkbenchCanvasResult>
+    | PluginWorkbenchCanvas
+    | PluginWorkbenchCanvasResult
+  /**
+   * 处理插件工作台动作调用
+   *
+   * 允许直接返回任意数据，或返回统一响应结构。
+   */
+  invokeWorkbenchAction?: (
+    action: PluginWorkbenchActionTrigger,
+  ) => Promise<PluginWorkbenchActionInvokeResult | unknown> | PluginWorkbenchActionInvokeResult | unknown
 }
 
 /** 插件相关 IPC 通道常量 */
@@ -216,4 +470,10 @@ export const PLUGIN_IPC_CHANNELS = {
   GET_STATUS: 'plugin:get-status',
   /** 调用插件能力 */
   INVOKE_CAPABILITY: 'plugin:invoke-capability',
+  /** 获取插件工作台列表 */
+  WORKBENCH_LIST: 'plugin:workbench:list',
+  /** 获取插件工作台画布 */
+  WORKBENCH_GET_CANVAS: 'plugin:workbench:get-canvas',
+  /** 调用插件工作台动作 */
+  WORKBENCH_INVOKE_ACTION: 'plugin:workbench:invoke-action',
 } as const

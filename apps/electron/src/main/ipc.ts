@@ -48,13 +48,19 @@ import type {
   PromaPermissionMode,
   AskUserResponse,
   PluginRecord,
+  PluginGetWorkbenchCanvasInput,
   PluginInstallInput,
+  PluginInvokeCapabilityInput,
+  PluginInvokeCapabilityResult,
+  PluginInvokeWorkbenchActionInput,
   PluginLifecycleInput,
   PluginStatusInput,
   PluginStatusResult,
   PluginOperationResult,
-  PluginInvokeCapabilityInput,
-  PluginInvokeCapabilityResult,
+  PluginWorkbenchActionInvokeResult,
+  PluginWorkbenchCanvasResult,
+  PluginWorkbenchListInput,
+  PluginWorkbenchListResult,
 } from '@proma/shared'
 import type { UserProfile, AppSettings } from '../types'
 import { getRuntimeStatus, getGitRepoStatus } from './lib/runtime-init'
@@ -121,13 +127,17 @@ import {
 } from './lib/agent-workspace-manager'
 import {
   listPlugins,
+  listPluginWorkbenches,
   installPluginFromLocal,
   enablePlugin,
   disablePlugin,
   uninstallPlugin,
   getPluginStatus,
+  getPluginWorkbenchCanvas,
   invokePluginCapability,
+  invokePluginWorkbenchAction,
   scanInstalledPlugins,
+  restoreActivePlugins,
 } from './lib/plugins/runtime'
 import {
   getLatestRelease,
@@ -187,12 +197,15 @@ export function registerIpcHandlers(): void {
     }
   )
 
-  // 预扫描已安装插件并恢复索引状态
-  try {
-    scanInstalledPlugins()
-  } catch (error) {
-    console.error('[插件] 启动扫描失败:', error)
-  }
+  // 预扫描已安装插件并恢复运行态，后续插件 IPC 统一等待该阶段完成。
+  const pluginRuntimeRestorePromise = (async (): Promise<void> => {
+    try {
+      scanInstalledPlugins()
+      await restoreActivePlugins()
+    } catch (error) {
+      console.error('[插件] 启动扫描失败:', error)
+    }
+  })()
 
   // ===== 插件管理相关 =====
 
@@ -200,6 +213,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     PLUGIN_IPC_CHANNELS.LIST,
     async (): Promise<PluginRecord[]> => {
+      await pluginRuntimeRestorePromise
       return listPlugins()
     }
   )
@@ -248,7 +262,35 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     PLUGIN_IPC_CHANNELS.INVOKE_CAPABILITY,
     async (_, input: PluginInvokeCapabilityInput): Promise<PluginInvokeCapabilityResult> => {
+      await pluginRuntimeRestorePromise
       return invokePluginCapability(input)
+    }
+  )
+
+  // 获取插件工作台列表
+  ipcMain.handle(
+    PLUGIN_IPC_CHANNELS.WORKBENCH_LIST,
+    async (_, input?: PluginWorkbenchListInput): Promise<PluginWorkbenchListResult> => {
+      await pluginRuntimeRestorePromise
+      return listPluginWorkbenches(input)
+    }
+  )
+
+  // 获取插件工作台画布
+  ipcMain.handle(
+    PLUGIN_IPC_CHANNELS.WORKBENCH_GET_CANVAS,
+    async (_, input: PluginGetWorkbenchCanvasInput): Promise<PluginWorkbenchCanvasResult> => {
+      await pluginRuntimeRestorePromise
+      return getPluginWorkbenchCanvas(input)
+    }
+  )
+
+  // 调用插件工作台动作
+  ipcMain.handle(
+    PLUGIN_IPC_CHANNELS.WORKBENCH_INVOKE_ACTION,
+    async (_, input: PluginInvokeWorkbenchActionInput): Promise<PluginWorkbenchActionInvokeResult> => {
+      await pluginRuntimeRestorePromise
+      return invokePluginWorkbenchAction(input)
     }
   )
 

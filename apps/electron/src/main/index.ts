@@ -6,6 +6,7 @@ import { registerIpcHandlers } from './ipc'
 import { createTray, destroyTray } from './tray'
 import { initializeRuntime } from './lib/runtime-init'
 import { seedDefaultSkills } from './lib/config-paths'
+import { initializePluginWorkbenchDebugLogSession } from './lib/plugins/runtime'
 import { stopAllAgents } from './lib/agent-service'
 import { stopAllGenerations } from './lib/chat-service'
 import { initAutoUpdater, cleanupUpdater } from './lib/updater/auto-updater'
@@ -102,7 +103,7 @@ function createWindow(): void {
   // Load the renderer
   const isDev = !app.isPackaged
   if (isDev) {
-    mainWindow.loadURL('http://localhost:5173')
+    mainWindow.loadURL('http://localhost:5180')
     mainWindow.webContents.openDevTools()
   } else {
     mainWindow.loadFile(join(__dirname, 'renderer', 'index.html'))
@@ -155,6 +156,10 @@ app.whenReady().then(async () => {
 
   // 同步默认 Skills 模板到 ~/.proma/default-skills/
   seedDefaultSkills()
+
+  // 插件工作台调试日志：每次应用启动创建独立日志文件，避免多次运行混杂。
+  const pluginWorkbenchLogPath = initializePluginWorkbenchDebugLogSession()
+  console.log('[插件工作台调试] 本次会话日志文件:', pluginWorkbenchLogPath)
 
   // Create application menu
   const menu = createApplicationMenu()

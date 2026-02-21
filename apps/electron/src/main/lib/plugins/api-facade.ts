@@ -7,8 +7,11 @@
 import { dirname, resolve, sep } from 'node:path'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import type {
+  PluginInvokeWorkbenchActionInput,
   PluginManifest,
   PluginRuntimeContext,
+  PluginWorkbenchActionInvokeResult,
+  PluginWorkbenchActionTrigger,
 } from '@proma/shared'
 import { assertPluginPermission } from './permission-gate'
 
@@ -34,6 +37,10 @@ export function createPluginRuntimeContext(
   options: {
     abortSignal: AbortSignal
     registerCleanup: (cleanup: () => void | Promise<void>) => void
+    invokePluginCapability: (capabilityKey: string, payload?: Record<string, unknown>) => Promise<unknown>
+    invokeWorkbenchAction: (
+      input: PluginInvokeWorkbenchActionInput,
+    ) => Promise<PluginWorkbenchActionInvokeResult>
   },
 ): PluginRuntimeContext {
   return {
@@ -97,6 +104,38 @@ export function createPluginRuntimeContext(
           if (options.abortSignal.aborted) {
             throw new Error(`插件已终止: ${manifest.id}`)
           }
+        },
+      },
+      workbench: {
+        readFile: async (targetPath: string): Promise<string> => {
+          assertPluginPermission(manifest, 'filesystem:read')
+          if (options.abortSignal.aborted) {
+            throw new Error(`插件已终止: ${manifest.id}`)
+          }
+          const safePath = resolveWorkspaceFilePath(workspacePath, targetPath)
+          return readFileSync(safePath, 'utf-8')
+        },
+        invokeCapability: async (
+          capabilityKey: string,
+          payload?: Record<string, unknown>,
+        ): Promise<unknown> => {
+          if (options.abortSignal.aborted) {
+            throw new Error(`插件已终止: ${manifest.id}`)
+          }
+
+          return options.invokePluginCapability(capabilityKey, payload)
+        },
+        invokeAction: async (
+          action: PluginWorkbenchActionTrigger,
+        ): Promise<PluginWorkbenchActionInvokeResult> => {
+          if (options.abortSignal.aborted) {
+            throw new Error(`插件已终止: ${manifest.id}`)
+          }
+
+          return options.invokeWorkbenchAction({
+            pluginId: manifest.id,
+            action,
+          })
         },
       },
     },

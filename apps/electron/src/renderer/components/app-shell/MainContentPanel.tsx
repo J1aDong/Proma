@@ -2,7 +2,7 @@
  * MainContentPanel - 主内容面板
  *
  * 根据当前活跃视图显示不同内容：
- * - conversations: 根据 App 模式显示 Chat/Agent 内容
+ * - conversations: 根据 App 模式显示 Chat/Agent/Plugin 内容
  * - settings: 显示设置面板
  */
 
@@ -13,6 +13,7 @@ import { activeViewAtom } from '@/atoms/active-view'
 import { Panel } from './Panel'
 import { ChatView } from '@/components/chat'
 import { AgentView } from '@/components/agent'
+import { PluginWorkbenchView } from '@/components/plugin-workbench'
 import { SettingsPanel } from '@/components/settings'
 
 export function MainContentPanel(): React.ReactElement {
@@ -21,7 +22,9 @@ export function MainContentPanel(): React.ReactElement {
 
   /** 渲染对话视图内容 */
   const renderConversations = (): React.ReactElement => {
-    return mode === 'chat' ? <ChatView /> : <AgentView />
+    if (mode === 'chat') return <ChatView />
+    if (mode === 'agent') return <AgentView />
+    return <PluginWorkbenchView />
   }
 
   return (

@@ -56,13 +56,19 @@ import type {
   AskUserRequest,
   AskUserResponse,
   PluginRecord,
+  PluginGetWorkbenchCanvasInput,
   PluginInstallInput,
+  PluginInvokeCapabilityInput,
+  PluginInvokeCapabilityResult,
+  PluginInvokeWorkbenchActionInput,
   PluginLifecycleInput,
   PluginStatusInput,
   PluginStatusResult,
   PluginOperationResult,
-  PluginInvokeCapabilityInput,
-  PluginInvokeCapabilityResult,
+  PluginWorkbenchActionInvokeResult,
+  PluginWorkbenchCanvasResult,
+  PluginWorkbenchListInput,
+  PluginWorkbenchListResult,
 } from '@proma/shared'
 import type { UserProfile, AppSettings } from '../types'
 
@@ -257,6 +263,15 @@ export interface ElectronAPI {
 
   /** 调用插件能力 */
   invokePluginCapability: (input: PluginInvokeCapabilityInput) => Promise<PluginInvokeCapabilityResult>
+
+  /** 获取插件工作台列表 */
+  listPluginWorkbenches: (input?: PluginWorkbenchListInput) => Promise<PluginWorkbenchListResult>
+
+  /** 获取插件工作台画布 */
+  getPluginWorkbenchCanvas: (input: PluginGetWorkbenchCanvasInput) => Promise<PluginWorkbenchCanvasResult>
+
+  /** 调用插件工作台动作 */
+  invokePluginWorkbenchAction: (input: PluginInvokeWorkbenchActionInput) => Promise<PluginWorkbenchActionInvokeResult>
 
   // ===== Agent 会话管理相关 =====
 
@@ -658,6 +673,18 @@ const electronAPI: ElectronAPI = {
 
   invokePluginCapability: (input: PluginInvokeCapabilityInput) => {
     return ipcRenderer.invoke(PLUGIN_IPC_CHANNELS.INVOKE_CAPABILITY, input)
+  },
+
+  listPluginWorkbenches: (input?: PluginWorkbenchListInput) => {
+    return ipcRenderer.invoke(PLUGIN_IPC_CHANNELS.WORKBENCH_LIST, input)
+  },
+
+  getPluginWorkbenchCanvas: (input: PluginGetWorkbenchCanvasInput) => {
+    return ipcRenderer.invoke(PLUGIN_IPC_CHANNELS.WORKBENCH_GET_CANVAS, input)
+  },
+
+  invokePluginWorkbenchAction: (input: PluginInvokeWorkbenchActionInput) => {
+    return ipcRenderer.invoke(PLUGIN_IPC_CHANNELS.WORKBENCH_INVOKE_ACTION, input)
   },
 
   // Agent 会话管理
