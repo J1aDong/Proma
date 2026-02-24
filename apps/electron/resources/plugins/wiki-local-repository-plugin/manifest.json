@@ -2,21 +2,23 @@
   "manifestVersion": 1,
   "id": "wiki-local-repository-plugin",
   "name": "本地仓库 Wiki",
-  "version": "0.1.1",
-  "description": "分析本地代码仓库并生成可浏览的 Wiki 内容",
+  "version": "0.2.1",
+  "description": "分析本地代码仓库并构建可检索文档库，支持任务控制与继续聊天",
   "author": "Proma",
   "entry": {
     "main": "index.mjs"
   },
   "permissions": [
     "filesystem:read",
-    "filesystem:write"
+    "filesystem:write",
+    "llm:invoke",
+    "channels:read"
   ],
   "capabilities": [
     {
       "key": "wiki:local-repository",
       "title": "本地仓库 Wiki",
-      "description": "分析本地仓库结构并生成 Wiki 页面",
+      "description": "分析本地仓库并构建知识库，支持继续聊天",
       "config": {
         "version": "v1",
         "workbenchCanvasHook": true

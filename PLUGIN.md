@@ -90,7 +90,26 @@ Manifest 建议最小字段：
 `context.api`：
 
 - `llm` / `fs` / `mcp` / `events`（由宿主 facade 提供）
+- `aiIndexing`：宿主统一 AI 扫描索引能力（`startScan`、`pauseTask`、`resumeTask`、`stopTask`、`getTaskStatus`、`getLatestIndexSummary`）
+- `documentChat`：宿主统一文档会话桥接能力（`send`、`endSession`、`getHistory`）
 - 插件禁止直接访问宿主内部 service。
+
+### 5.1 插件系统基础能力（新增）
+
+宿主已提供以下可复用基础能力，插件应优先使用，不再在插件内重复实现：
+
+1. `PluginTaskRuntime`
+   - 统一状态机：`idle/running/paused/stopped/completed/failed`
+   - 幂等命令处理：重复 `pause/stop` 不进入异常状态
+   - 生命周期事件：`started/progress/paused/resumed/stopped/completed/failed`
+2. `AI Indexing Service`
+   - 标准流水线：仓库遍历 -> 语义分块 -> Embedding -> 索引落盘
+   - 元数据契约：模型、分块策略、索引版本、仓库指纹、生成时间
+   - 增量复用：同仓库重复扫描时按文件指纹复用分块
+3. `PluginDocumentChatBridge`
+   - 会话隔离键：`pluginId + knowledgeBaseId + sessionId`
+   - 流式事件：`delta/citation/done/error`
+   - 与索引元数据联动校验，失败时返回可诊断错误
 
 ## 6. UI 一致性规范（重点）
 
@@ -115,6 +134,8 @@ Manifest 建议最小字段：
 | 信息块 | `Card` | 承载指标、列表、表单片段、动作入口 |
 | 顶部操作区 | `Toolbar` | 放置筛选、搜索、刷新、主次操作 |
 | 文档展示 | `Markdown Viewer` | 渲染帮助文档、运行说明、结果详情 |
+| 任务运行态 | `Task Status` | 统一展示任务状态、进度、阶段、错误与控制按钮 |
+| 文档会话区 | `Document Chat` | 统一输入框、流式回答、引用列表与错误态 |
 
 状态表达一致性（必须统一）：
 
@@ -122,6 +143,7 @@ Manifest 建议最小字段：
 - 加载态：使用宿主统一加载反馈（骨架或加载提示），避免局部闪烁和布局跳变。
 - 错误态：使用宿主统一错误块（错误信息 + 重试入口），错误信息应可诊断。
 - 成功态：使用宿主统一成功反馈样式（内容更新或成功提示），避免和错误态视觉混淆。
+- 运行态：长任务必须通过宿主 `task-status` 区块显示，不在插件内部私有实现状态条。
 
 ### 6.3 未声明画布钩子的默认占位策略
 

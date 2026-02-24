@@ -61,6 +61,19 @@ import type {
   PluginWorkbenchCanvasResult,
   PluginWorkbenchListInput,
   PluginWorkbenchListResult,
+  PluginStartAiIndexingTaskInput,
+  PluginTaskControlInput,
+  PluginTaskEvent,
+  PluginTaskOperationResult,
+  PluginTaskStatusInput,
+  PluginDocumentChatSendInput,
+  PluginDocumentChatSendResult,
+  PluginDocumentChatEndInput,
+  PluginDocumentChatHistoryInput,
+  PluginDocumentChatHistoryResult,
+  PluginDocumentChatEvent,
+  PluginForceSyncBundledInput,
+  PluginForceSyncBundledResult,
 } from '@proma/shared'
 import type { UserProfile, AppSettings } from '../types'
 import { getRuntimeStatus, getGitRepoStatus } from './lib/runtime-init'
@@ -136,8 +149,19 @@ import {
   getPluginWorkbenchCanvas,
   invokePluginCapability,
   invokePluginWorkbenchAction,
+  startPluginAiIndexingTask,
+  pausePluginTask,
+  resumePluginTask,
+  stopPluginTask,
+  getPluginTaskStatus,
+  sendPluginDocumentChat,
+  endPluginDocumentChat,
+  getPluginDocumentChatHistory,
+  onPluginTaskEvent,
+  onPluginDocumentChatEvent,
   scanInstalledPlugins,
   restoreActivePlugins,
+  forceSyncBundledPlugin,
 } from './lib/plugins/runtime'
 import {
   getLatestRelease,
@@ -207,6 +231,18 @@ export function registerIpcHandlers(): void {
     }
   })()
 
+  onPluginTaskEvent((event: PluginTaskEvent) => {
+    BrowserWindow.getAllWindows().forEach((window) => {
+      window.webContents.send(PLUGIN_IPC_CHANNELS.TASK_STREAM_EVENT, event)
+    })
+  })
+
+  onPluginDocumentChatEvent((event: PluginDocumentChatEvent) => {
+    BrowserWindow.getAllWindows().forEach((window) => {
+      window.webContents.send(PLUGIN_IPC_CHANNELS.DOC_CHAT_STREAM_EVENT, event)
+    })
+  })
+
   // ===== 插件管理相关 =====
 
   // 获取插件列表
@@ -247,6 +283,14 @@ export function registerIpcHandlers(): void {
     PLUGIN_IPC_CHANNELS.UNINSTALL,
     async (_, input: PluginLifecycleInput): Promise<PluginOperationResult> => {
       return uninstallPlugin(input)
+    }
+  )
+
+  // 强制同步内置插件
+  ipcMain.handle(
+    PLUGIN_IPC_CHANNELS.FORCE_SYNC_BUNDLED,
+    async (_, input: PluginForceSyncBundledInput): Promise<PluginForceSyncBundledResult> => {
+      return forceSyncBundledPlugin(input)
     }
   )
 
@@ -292,6 +336,78 @@ export function registerIpcHandlers(): void {
       await pluginRuntimeRestorePromise
       return invokePluginWorkbenchAction(input)
     }
+  )
+
+  // 启动插件 AI 扫描任务
+  ipcMain.handle(
+    PLUGIN_IPC_CHANNELS.TASK_START_AI_INDEXING,
+    async (_, input: PluginStartAiIndexingTaskInput): Promise<PluginTaskOperationResult> => {
+      await pluginRuntimeRestorePromise
+      return startPluginAiIndexingTask(input)
+    },
+  )
+
+  // 暂停插件任务
+  ipcMain.handle(
+    PLUGIN_IPC_CHANNELS.TASK_PAUSE,
+    async (_, input: PluginTaskControlInput): Promise<PluginTaskOperationResult> => {
+      await pluginRuntimeRestorePromise
+      return pausePluginTask(input)
+    },
+  )
+
+  // 继续插件任务
+  ipcMain.handle(
+    PLUGIN_IPC_CHANNELS.TASK_RESUME,
+    async (_, input: PluginTaskControlInput): Promise<PluginTaskOperationResult> => {
+      await pluginRuntimeRestorePromise
+      return resumePluginTask(input)
+    },
+  )
+
+  // 停止插件任务
+  ipcMain.handle(
+    PLUGIN_IPC_CHANNELS.TASK_STOP,
+    async (_, input: PluginTaskControlInput): Promise<PluginTaskOperationResult> => {
+      await pluginRuntimeRestorePromise
+      return stopPluginTask(input)
+    },
+  )
+
+  // 查询插件任务状态
+  ipcMain.handle(
+    PLUGIN_IPC_CHANNELS.TASK_GET_STATUS,
+    async (_, input: PluginTaskStatusInput): Promise<PluginTaskOperationResult> => {
+      await pluginRuntimeRestorePromise
+      return getPluginTaskStatus(input)
+    },
+  )
+
+  // 发送文档会话消息
+  ipcMain.handle(
+    PLUGIN_IPC_CHANNELS.DOC_CHAT_SEND,
+    async (_, input: PluginDocumentChatSendInput): Promise<PluginDocumentChatSendResult> => {
+      await pluginRuntimeRestorePromise
+      return sendPluginDocumentChat(input)
+    },
+  )
+
+  // 结束文档会话
+  ipcMain.handle(
+    PLUGIN_IPC_CHANNELS.DOC_CHAT_END,
+    async (_, input: PluginDocumentChatEndInput): Promise<{ success: boolean; error?: string }> => {
+      await pluginRuntimeRestorePromise
+      return endPluginDocumentChat(input)
+    },
+  )
+
+  // 查询文档会话历史
+  ipcMain.handle(
+    PLUGIN_IPC_CHANNELS.DOC_CHAT_GET_HISTORY,
+    async (_, input: PluginDocumentChatHistoryInput): Promise<PluginDocumentChatHistoryResult> => {
+      await pluginRuntimeRestorePromise
+      return getPluginDocumentChatHistory(input)
+    },
   )
 
   // ===== 渠道管理相关 =====

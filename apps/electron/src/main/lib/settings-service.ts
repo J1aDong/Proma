@@ -11,6 +11,14 @@ import { DEFAULT_THEME_MODE } from '../../types'
 import type { AppSettings } from '../../types'
 
 /**
+ * 获取 Agent 默认模型 ID（若未配置返回 undefined）
+ */
+export function getAgentModelIdFromSettings(): string | undefined {
+  const modelId = getSettings().agentModelId?.trim()
+  return modelId && modelId.length > 0 ? modelId : undefined
+}
+
+/**
  * 获取应用设置
  *
  * 如果文件不存在，返回默认设置。

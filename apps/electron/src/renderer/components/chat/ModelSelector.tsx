@@ -69,15 +69,21 @@ interface ModelSelectorProps {
   /** 仅显示此渠道的模型 */
   filterChannelId?: string
   /** 外部选中模型（不传则用内部 selectedModelAtom） */
-  externalSelectedModel?: { channelId: string; modelId: string } | null
+  externalSelectedModelId?: string | null
   /** 外部选择回调 */
   onModelSelect?: (option: ModelOption) => void
+  /** 是否在列表顶部注入 __auto__（自动选择）选项 */
+  includeAutoOption?: boolean
+  /** 自定义触发按钮样式 */
+  triggerClassName?: string
 }
 
 export function ModelSelector({
   filterChannelId,
-  externalSelectedModel,
+  externalSelectedModelId,
   onModelSelect,
+  includeAutoOption = false,
+  triggerClassName,
 }: ModelSelectorProps = {}): React.ReactElement {
   const [internalSelectedModel, setInternalSelectedModel] = useAtom(selectedModelAtom)
   const currentConversationId = useAtomValue(currentConversationIdAtom)
@@ -86,10 +92,29 @@ export function ModelSelector({
   const [open, setOpen] = React.useState(false)
   const [search, setSearch] = React.useState('')
 
-  // 外部模型优先，否则用内部 atom
-  const selectedModel = externalSelectedModel !== undefined ? externalSelectedModel : internalSelectedModel
+  const modelOptions = React.useMemo(() => buildModelOptions(channels, filterChannelId), [channels, filterChannelId])
 
-  // 加载渠道列表
+  // 外部模型优先，否则用内部 atom
+  const selectedModel = externalSelectedModelId !== undefined
+    ? (externalSelectedModelId === '__auto__' ? { channelId: '__auto__', modelId: '__auto__' } : modelOptions.find(m => m.modelId === externalSelectedModelId))
+    : internalSelectedModel
+
+  // 构建展示选项列表，处理 __auto__ 注入
+  const displayModelOptions = React.useMemo(() => {
+    if (!includeAutoOption) return modelOptions
+
+    return [
+      {
+        channelId: '__auto__',
+        channelName: '系统推荐',
+        modelId: '__auto__',
+        modelName: '自动选择（默认）',
+        provider: 'auto' as any // Type assertion for UI rendering
+      },
+      ...modelOptions
+    ]
+  }, [modelOptions, includeAutoOption])
+
   React.useEffect(() => {
     window.electronAPI.listChannels().then(setChannels).catch(console.error)
   }, [])
@@ -102,17 +127,15 @@ export function ModelSelector({
     }
   }, [open])
 
-  const modelOptions = React.useMemo(() => buildModelOptions(channels, filterChannelId), [channels, filterChannelId])
-  const grouped = React.useMemo(() => groupByChannel(modelOptions), [modelOptions])
-
   // 搜索过滤
   const filteredGrouped = React.useMemo(() => {
-    if (!search.trim()) return grouped
+    const groupedDisplay = groupByChannel(displayModelOptions)
+    if (!search.trim()) return groupedDisplay
 
     const query = search.toLowerCase()
     const filtered = new Map<string, ModelOption[]>()
 
-    for (const [channelId, options] of grouped.entries()) {
+    for (const [channelId, options] of groupedDisplay.entries()) {
       const matchedOptions = options.filter(
         (o) =>
           o.modelName.toLowerCase().includes(query) ||
@@ -124,7 +147,7 @@ export function ModelSelector({
     }
 
     return filtered
-  }, [grouped, search])
+  }, [displayModelOptions, search])
 
   // 扁平化过滤后的模型列表，用于键盘导航
   const flatOptions = React.useMemo(() => {
@@ -215,7 +238,10 @@ export function ModelSelector({
       <button
         type="button"
         onClick={() => setOpen(true)}
-        className="flex items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
+        className={cn(
+          "flex items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-accent transition-colors",
+          triggerClassName
+        )}
       >
         {currentModelInfo ? (
           <img

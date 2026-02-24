@@ -40,6 +40,8 @@ export function PluginSettings(): React.ReactElement {
 
   const [installPath, setInstallPath] = React.useState('')
   const [invokingPluginId, setInvokingPluginId] = React.useState<string | null>(null)
+  const [forceSyncLoading, setForceSyncLoading] = React.useState(false)
+  const [forceSyncMessage, setForceSyncMessage] = React.useState<{ type: 'success' | 'error'; text: string } | null>(null)
 
   React.useEffect(() => {
     void loadPlugins()
@@ -84,6 +86,27 @@ export function PluginSettings(): React.ReactElement {
       })
     } finally {
       setInvokingPluginId(null)
+    }
+  }
+
+  const handleForceSyncBundled = async (): Promise<void> => {
+    setForceSyncLoading(true)
+    setForceSyncMessage(null)
+
+    try {
+      await window.electronAPI.forceSyncBundledPlugin({ pluginId: 'wiki-local-repository-plugin' })
+      await loadPlugins() // 重新加载插件列表
+      setForceSyncMessage({ type: 'success', text: '内置插件同步成功' })
+    } catch (error) {
+      console.error('强制同步内置插件失败:', error)
+      setForceSyncMessage({
+        type: 'error',
+        text: `同步失败: ${error instanceof Error ? error.message : '未知错误'}`
+      })
+    } finally {
+      setForceSyncLoading(false)
+      // 3秒后清除消息
+      setTimeout(() => setForceSyncMessage(null), 3000)
     }
   }
 
@@ -181,6 +204,36 @@ export function PluginSettings(): React.ReactElement {
             })}
           </SettingsCard>
         )}
+      </SettingsSection>
+
+      <SettingsSection
+        title="内置插件管理"
+        description="强制同步内置插件到最新版本"
+      >
+        <SettingsCard divided={false}>
+          <div className="p-4 space-y-3">
+            <Button
+              variant="outline"
+              onClick={() => void handleForceSyncBundled()}
+              disabled={loading || forceSyncLoading}
+            >
+              {forceSyncLoading ? <Loader2 size={14} className="animate-spin" /> : <Plug size={14} />}
+              <span>强制同步内置插件</span>
+            </Button>
+            <p className="text-xs text-muted-foreground">
+              将内置插件强制更新到应用程序包含的最新版本
+            </p>
+            {forceSyncMessage && (
+              <p className={`text-sm ${
+                forceSyncMessage.type === 'success'
+                  ? 'text-green-600'
+                  : 'text-destructive'
+              }`}>
+                {forceSyncMessage.text}
+              </p>
+            )}
+          </div>
+        </SettingsCard>
       </SettingsSection>
 
       <SettingsSection

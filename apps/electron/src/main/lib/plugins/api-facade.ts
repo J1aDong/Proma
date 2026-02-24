@@ -7,9 +7,20 @@
 import { dirname, resolve, sep } from 'node:path'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import type {
+  PluginAiIndexSummary,
+  PluginChannelModel,
+  PluginDocumentChatEndInput,
+  PluginDocumentChatHistoryInput,
+  PluginDocumentChatHistoryResult,
+  PluginDocumentChatSendInput,
+  PluginDocumentChatSendResult,
   PluginInvokeWorkbenchActionInput,
   PluginManifest,
   PluginRuntimeContext,
+  PluginStartAiIndexingTaskInput,
+  PluginTaskControlInput,
+  PluginTaskOperationResult,
+  PluginTaskStatusInput,
   PluginWorkbenchActionInvokeResult,
   PluginWorkbenchActionTrigger,
 } from '@proma/shared'
@@ -41,6 +52,35 @@ export function createPluginRuntimeContext(
     invokeWorkbenchAction: (
       input: PluginInvokeWorkbenchActionInput,
     ) => Promise<PluginWorkbenchActionInvokeResult>
+    getAvailableModels: () => Promise<PluginChannelModel[]>
+    startAiIndexingTask: (
+      input: PluginStartAiIndexingTaskInput,
+    ) => Promise<PluginTaskOperationResult> | PluginTaskOperationResult
+    pausePluginTask: (
+      input: PluginTaskControlInput,
+    ) => Promise<PluginTaskOperationResult> | PluginTaskOperationResult
+    resumePluginTask: (
+      input: PluginTaskControlInput,
+    ) => Promise<PluginTaskOperationResult> | PluginTaskOperationResult
+    stopPluginTask: (
+      input: PluginTaskControlInput,
+    ) => Promise<PluginTaskOperationResult> | PluginTaskOperationResult
+    getPluginTaskStatus: (
+      input: PluginTaskStatusInput,
+    ) => Promise<PluginTaskOperationResult> | PluginTaskOperationResult
+    getLatestIndexSummary: (
+      pluginId: string,
+      knowledgeBaseId?: string,
+    ) => Promise<PluginAiIndexSummary | null>
+    sendDocumentChat: (
+      input: PluginDocumentChatSendInput,
+    ) => Promise<PluginDocumentChatSendResult>
+    endDocumentChat: (
+      input: PluginDocumentChatEndInput,
+    ) => Promise<{ success: boolean; error?: string }>
+    getDocumentChatHistory: (
+      input: PluginDocumentChatHistoryInput,
+    ) => Promise<PluginDocumentChatHistoryResult>
   },
 ): PluginRuntimeContext {
   return {
@@ -106,6 +146,16 @@ export function createPluginRuntimeContext(
           }
         },
       },
+      channels: {
+        getAvailableModels: async (): Promise<PluginChannelModel[]> => {
+          assertPluginPermission(manifest, 'channels:read')
+          if (options.abortSignal.aborted) {
+            throw new Error(`插件已终止: ${manifest.id}`)
+          }
+
+          return options.getAvailableModels()
+        },
+      },
       workbench: {
         readFile: async (targetPath: string): Promise<string> => {
           assertPluginPermission(manifest, 'filesystem:read')
@@ -135,6 +185,100 @@ export function createPluginRuntimeContext(
           return options.invokeWorkbenchAction({
             pluginId: manifest.id,
             action,
+          })
+        },
+      },
+      aiIndexing: {
+        startScan: async (taskInput): Promise<PluginTaskOperationResult> => {
+          assertPluginPermission(manifest, 'filesystem:read')
+          assertPluginPermission(manifest, 'llm:invoke')
+          if (options.abortSignal.aborted) {
+            throw new Error(`插件已终止: ${manifest.id}`)
+          }
+
+          return options.startAiIndexingTask({
+            pluginId: manifest.id,
+            ...taskInput,
+          })
+        },
+        pauseTask: async (controlInput): Promise<PluginTaskOperationResult> => {
+          if (options.abortSignal.aborted) {
+            throw new Error(`插件已终止: ${manifest.id}`)
+          }
+
+          return options.pausePluginTask({
+            pluginId: manifest.id,
+            ...controlInput,
+          })
+        },
+        resumeTask: async (controlInput): Promise<PluginTaskOperationResult> => {
+          if (options.abortSignal.aborted) {
+            throw new Error(`插件已终止: ${manifest.id}`)
+          }
+
+          return options.resumePluginTask({
+            pluginId: manifest.id,
+            ...controlInput,
+          })
+        },
+        stopTask: async (controlInput): Promise<PluginTaskOperationResult> => {
+          if (options.abortSignal.aborted) {
+            throw new Error(`插件已终止: ${manifest.id}`)
+          }
+
+          return options.stopPluginTask({
+            pluginId: manifest.id,
+            ...controlInput,
+          })
+        },
+        getTaskStatus: async (statusInput): Promise<PluginTaskOperationResult> => {
+          if (options.abortSignal.aborted) {
+            throw new Error(`插件已终止: ${manifest.id}`)
+          }
+
+          return options.getPluginTaskStatus({
+            pluginId: manifest.id,
+            ...statusInput,
+          })
+        },
+        getLatestIndexSummary: async (knowledgeBaseId?: string): Promise<PluginAiIndexSummary | null> => {
+          if (options.abortSignal.aborted) {
+            throw new Error(`插件已终止: ${manifest.id}`)
+          }
+
+          return options.getLatestIndexSummary(manifest.id, knowledgeBaseId)
+        },
+      },
+      documentChat: {
+        send: async (chatInput): Promise<PluginDocumentChatSendResult> => {
+          assertPluginPermission(manifest, 'llm:invoke')
+          if (options.abortSignal.aborted) {
+            throw new Error(`插件已终止: ${manifest.id}`)
+          }
+
+          return options.sendDocumentChat({
+            pluginId: manifest.id,
+            ...chatInput,
+          })
+        },
+        endSession: async (chatInput): Promise<{ success: boolean; error?: string }> => {
+          if (options.abortSignal.aborted) {
+            throw new Error(`插件已终止: ${manifest.id}`)
+          }
+
+          return options.endDocumentChat({
+            pluginId: manifest.id,
+            ...chatInput,
+          })
+        },
+        getHistory: async (chatInput): Promise<PluginDocumentChatHistoryResult> => {
+          if (options.abortSignal.aborted) {
+            throw new Error(`插件已终止: ${manifest.id}`)
+          }
+
+          return options.getDocumentChatHistory({
+            pluginId: manifest.id,
+            ...chatInput,
           })
         },
       },

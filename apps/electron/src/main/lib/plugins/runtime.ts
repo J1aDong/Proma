@@ -7,7 +7,15 @@
 import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import type {
+  PluginChannelModel,
+  PluginDocumentChatEndInput,
+  PluginDocumentChatEvent,
+  PluginDocumentChatHistoryInput,
+  PluginDocumentChatHistoryResult,
+  PluginDocumentChatSendInput,
+  PluginDocumentChatSendResult,
   PluginGetWorkbenchCanvasInput,
+  PluginStartAiIndexingTaskInput,
   PluginInstallInput,
   PluginInvokeCapabilityInput,
   PluginInvokeCapabilityResult,
@@ -20,6 +28,10 @@ import type {
   PluginRecord,
   PluginStatusInput,
   PluginStatusResult,
+  PluginTaskControlInput,
+  PluginTaskEvent,
+  PluginTaskOperationResult,
+  PluginTaskStatusInput,
   PluginWorkbenchActionInvokeResult,
   PluginWorkbenchActionTrigger,
   PluginWorkbenchCanvas,
@@ -29,6 +41,8 @@ import type {
   PluginWorkbenchListItem,
   PluginWorkbenchListResult,
   PluginWorkbenchResponse,
+  PluginForceSyncBundledInput,
+  PluginForceSyncBundledResult,
 } from '@proma/shared'
 import {
   getConfigDir,
@@ -38,6 +52,8 @@ import {
   getPluginWorkspacesDir,
 } from '../config-paths'
 import { createPluginRuntimeContext } from './api-facade'
+import { getLatestIndexSummary, startAiIndexingTask } from './ai-indexing-service'
+import { pluginDocumentChatBridge } from './document-chat-bridge'
 import { loadPluginModule } from './loader'
 import {
   addPluginRecord,
@@ -47,6 +63,7 @@ import {
   updatePluginManifest,
   updatePluginState,
 } from './registry'
+import { pluginTaskRuntime } from './task-runtime'
 
 interface ActivePluginRuntime {
   record: PluginRecord
@@ -66,6 +83,7 @@ const ALLOWED_PLUGIN_PERMISSIONS: ReadonlySet<PluginPermission> = new Set([
   'llm:invoke',
   'mcp:access',
   'events:emit',
+  'channels:read',
 ])
 
 const WORKBENCH_NODE_TYPES: ReadonlySet<string> = new Set([
@@ -75,9 +93,35 @@ const WORKBENCH_NODE_TYPES: ReadonlySet<string> = new Set([
   'card',
   'toolbar',
   'markdown',
+  'task-status',
+  'document-chat',
 ])
 
 const PLUGIN_WORKBENCH_DEBUG_LOG_NAME_PREFIX = 'plugin-workbench-debug'
+
+/**
+ * 获取可用的模型列表
+ */
+async function getAvailableModels(): Promise<PluginChannelModel[]> {
+  const { listChannels } = await import('../channel-manager')
+  const channels = listChannels().filter((channel) => channel.enabled)
+
+  const models: PluginChannelModel[] = []
+
+  for (const channel of channels) {
+    for (const model of channel.models) {
+      if (model.enabled) {
+        models.push({
+          id: model.id,
+          name: model.name || model.id,
+          channelName: channel.name,
+        })
+      }
+    }
+  }
+
+  return models.sort((a, b) => a.name.localeCompare(b.name))
+}
 
 function getPluginWorkbenchDebugLogPath(): string {
   const logsDir = join(getConfigDir(), 'logs')
@@ -461,6 +505,34 @@ export async function enablePlugin(input: PluginLifecycleInput): Promise<PluginO
       invokeWorkbenchAction: async (actionInput): Promise<PluginWorkbenchActionInvokeResult> => {
         return invokePluginWorkbenchAction(actionInput)
       },
+      startAiIndexingTask: async (taskInput): Promise<PluginTaskOperationResult> => {
+        return startPluginAiIndexingTask(taskInput)
+      },
+      pausePluginTask: async (taskInput): Promise<PluginTaskOperationResult> => {
+        return pausePluginTask(taskInput)
+      },
+      resumePluginTask: async (taskInput): Promise<PluginTaskOperationResult> => {
+        return resumePluginTask(taskInput)
+      },
+      stopPluginTask: async (taskInput): Promise<PluginTaskOperationResult> => {
+        return stopPluginTask(taskInput)
+      },
+      getPluginTaskStatus: async (taskInput): Promise<PluginTaskOperationResult> => {
+        return getPluginTaskStatus(taskInput)
+      },
+      getLatestIndexSummary: async (pluginId, knowledgeBaseId) => {
+        return getLatestIndexSummary(pluginId, record.workspacePath, knowledgeBaseId)
+      },
+      sendDocumentChat: async (chatInput): Promise<PluginDocumentChatSendResult> => {
+        return sendPluginDocumentChat(chatInput)
+      },
+      endDocumentChat: async (chatInput): Promise<{ success: boolean; error?: string }> => {
+        return endPluginDocumentChat(chatInput)
+      },
+      getDocumentChatHistory: async (chatInput): Promise<PluginDocumentChatHistoryResult> => {
+        return getPluginDocumentChatHistory(chatInput)
+      },
+      getAvailableModels,
     })
 
     if (module.activate) {
@@ -560,6 +632,18 @@ export async function disablePlugin(input: PluginLifecycleInput): Promise<Plugin
     activePluginRuntimeMap.delete(record.id)
   }
 
+  try {
+    pluginTaskRuntime.stopTasksForPlugin(record.id)
+  } catch (error) {
+    errors.push(error instanceof Error ? error.message : String(error))
+  }
+
+  try {
+    pluginDocumentChatBridge.clearPluginSessions(record.id)
+  } catch (error) {
+    errors.push(error instanceof Error ? error.message : String(error))
+  }
+
   if (errors.length > 0) {
     const message = errors.join(' | ')
     const updated = updatePluginState(record.id, 'error', { lastError: message })
@@ -581,6 +665,146 @@ export async function disablePlugin(input: PluginLifecycleInput): Promise<Plugin
     state: updated.state,
     plugin: updated,
     message: '插件已禁用',
+  }
+}
+
+/** 强制同步内置插件（开发者专用） */
+export async function forceSyncBundledPlugin(input: PluginForceSyncBundledInput): Promise<PluginForceSyncBundledResult> {
+  const { pluginId } = input
+
+  // 1. 校验目标必须是内置插件
+  const bundledRoot = getBundledPluginsRoot()
+  if (!bundledRoot) {
+    return {
+      success: false,
+      pluginId,
+      stage: 'validate',
+      reloaded: false,
+      error: '未找到内置插件目录',
+    }
+  }
+
+  const pluginSourcePath = join(bundledRoot, pluginId)
+  const manifestPath = join(pluginSourcePath, 'manifest.json')
+  if (!existsSync(manifestPath)) {
+    return {
+      success: false,
+      pluginId,
+      stage: 'validate',
+      reloaded: false,
+      error: `内置插件不存在: ${pluginId}`,
+    }
+  }
+
+  let bundledManifest: PluginManifest
+  try {
+    bundledManifest = JSON.parse(readFileSync(manifestPath, 'utf-8')) as PluginManifest
+    validatePluginManifest(bundledManifest)
+  } catch (error) {
+    return {
+      success: false,
+      pluginId,
+      stage: 'validate',
+      reloaded: false,
+      error: `内置插件 manifest 无效: ${error instanceof Error ? error.message : String(error)}`,
+    }
+  }
+
+  if (bundledManifest.id !== pluginId) {
+    return {
+      success: false,
+      pluginId,
+      stage: 'validate',
+      reloaded: false,
+      error: `插件 ID 不匹配: manifest.id=${bundledManifest.id}, 期望=${pluginId}`,
+    }
+  }
+
+  // 2. 记录当前插件状态
+  const existing = getPluginRecord(pluginId)
+  const wasActive = existing?.state === 'active'
+  let reloaded = false
+
+  try {
+    // 3. 若 active：先 disable，释放运行态模块实例
+    if (wasActive) {
+      const disableResult = await disablePlugin({ pluginId })
+      if (!disableResult.success) {
+        return {
+          success: false,
+          pluginId,
+          stage: 'disable',
+          reloaded: false,
+          error: `禁用插件失败: ${disableResult.error}`,
+        }
+      }
+    }
+
+    // 4. 忽略版本判定，直接覆盖安装目录
+    const installPath = getPluginInstallPath(pluginId)
+    const workspacePath = getPluginWorkspacePath(pluginId)
+
+    rmSync(installPath, { recursive: true, force: true })
+    mkdirSync(installPath, { recursive: true })
+    cpSync(pluginSourcePath, installPath, { recursive: true })
+
+    if (!existsSync(workspacePath)) {
+      mkdirSync(workspacePath, { recursive: true })
+    }
+
+    // 5. 更新插件索引中的 manifest/updatedAt
+    const now = Date.now()
+    if (existing) {
+      updatePluginManifest(pluginId, bundledManifest)
+      if (existing.state === 'uninstalled') {
+        updatePluginState(pluginId, 'inactive')
+      }
+    } else {
+      addPluginRecord({
+        id: pluginId,
+        manifest: bundledManifest,
+        installPath,
+        workspacePath,
+        state: 'installed',
+        installedAt: now,
+        updatedAt: now,
+      })
+    }
+
+    // 6. 若之前 active：执行 enable 重新加载
+    if (wasActive) {
+      const enableResult = await enablePlugin({ pluginId })
+      if (!enableResult.success) {
+        return {
+          success: false,
+          pluginId,
+          stage: 'enable',
+          reloaded: false,
+          error: `重新启用插件失败: ${enableResult.error}`,
+          plugin: enableResult.plugin,
+        }
+      }
+      reloaded = true
+    }
+
+    const latest = getPluginRecord(pluginId)
+    return {
+      success: true,
+      pluginId,
+      stage: 'done',
+      reloaded,
+      message: `强制同步完成，插件版本: ${bundledManifest.version}`,
+      plugin: latest,
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    return {
+      success: false,
+      pluginId,
+      stage: 'copy',
+      reloaded: false,
+      error: `强制同步失败: ${message}`,
+    }
   }
 }
 
@@ -696,6 +920,134 @@ export async function invokePluginCapability(
       error: message,
     }
   }
+}
+
+/** 启动插件 AI 扫描任务 */
+export async function startPluginAiIndexingTask(
+  input: PluginStartAiIndexingTaskInput,
+): Promise<PluginTaskOperationResult> {
+  const record = getPluginRecord(input.pluginId)
+  if (!record) {
+    return {
+      success: false,
+      error: `插件不存在: ${input.pluginId}`,
+    }
+  }
+
+  if (record.state !== 'active') {
+    return {
+      success: false,
+      error: `插件未启用，当前状态: ${record.state}`,
+    }
+  }
+
+  return startAiIndexingTask({
+    pluginId: input.pluginId,
+    workspacePath: record.workspacePath,
+    payload: {
+      repositoryPath: input.repositoryPath,
+      knowledgeBaseId: input.knowledgeBaseId,
+      model: input.model,
+      language: input.language,
+      analysisDepth: input.analysisDepth,
+      chunkStrategy: input.chunkStrategy,
+    },
+  })
+}
+
+/** 暂停插件任务 */
+export function pausePluginTask(input: PluginTaskControlInput): PluginTaskOperationResult {
+  return pluginTaskRuntime.pauseTask(input.pluginId, input.taskId)
+}
+
+/** 继续插件任务 */
+export function resumePluginTask(input: PluginTaskControlInput): PluginTaskOperationResult {
+  return pluginTaskRuntime.resumeTask(input.pluginId, input.taskId)
+}
+
+/** 停止插件任务 */
+export function stopPluginTask(input: PluginTaskControlInput): PluginTaskOperationResult {
+  return pluginTaskRuntime.stopTask(input.pluginId, input.taskId)
+}
+
+/** 查询插件任务状态 */
+export function getPluginTaskStatus(input: PluginTaskStatusInput): PluginTaskOperationResult {
+  const task = pluginTaskRuntime.getTaskForPlugin(input.pluginId, input.taskId)
+  if (!task) {
+    return {
+      success: false,
+      error: `任务不存在: ${input.taskId}`,
+    }
+  }
+
+  return {
+    success: true,
+    task,
+  }
+}
+
+/** 发送插件文档会话消息 */
+export async function sendPluginDocumentChat(
+  input: PluginDocumentChatSendInput,
+): Promise<PluginDocumentChatSendResult> {
+  const record = getPluginRecord(input.pluginId)
+  if (!record) {
+    return {
+      success: false,
+      pluginId: input.pluginId,
+      knowledgeBaseId: input.knowledgeBaseId,
+      sessionId: input.sessionId ?? '',
+      error: `插件不存在: ${input.pluginId}`,
+    }
+  }
+
+  if (record.state !== 'active') {
+    return {
+      success: false,
+      pluginId: input.pluginId,
+      knowledgeBaseId: input.knowledgeBaseId,
+      sessionId: input.sessionId ?? '',
+      error: `插件未启用，当前状态: ${record.state}`,
+    }
+  }
+
+  return pluginDocumentChatBridge.sendMessage({
+    pluginId: input.pluginId,
+    workspacePath: record.workspacePath,
+    payload: {
+      knowledgeBaseId: input.knowledgeBaseId,
+      sessionId: input.sessionId,
+      model: input.model,
+      messages: input.messages,
+      topK: input.topK,
+    },
+  })
+}
+
+/** 结束插件文档会话 */
+export function endPluginDocumentChat(input: PluginDocumentChatEndInput): { success: boolean; error?: string } {
+  return pluginDocumentChatBridge.endSession({
+    pluginId: input.pluginId,
+    knowledgeBaseId: input.knowledgeBaseId,
+    sessionId: input.sessionId,
+  })
+}
+
+/** 查询插件文档会话历史 */
+export function getPluginDocumentChatHistory(
+  input: PluginDocumentChatHistoryInput,
+): PluginDocumentChatHistoryResult {
+  return pluginDocumentChatBridge.getHistory(input)
+}
+
+/** 订阅插件任务事件 */
+export function onPluginTaskEvent(listener: (event: PluginTaskEvent) => void): () => void {
+  return pluginTaskRuntime.onEvent(listener)
+}
+
+/** 订阅插件文档会话事件 */
+export function onPluginDocumentChatEvent(listener: (event: PluginDocumentChatEvent) => void): () => void {
+  return pluginDocumentChatBridge.onEvent(listener)
 }
 
 /** 获取插件工作台列表 */
@@ -987,7 +1339,7 @@ function isWorkbenchNode(value: unknown): boolean {
               return false
             }
 
-            if (typeof input.type !== 'string' || !['text', 'textarea', 'number', 'boolean', 'select', 'path'].includes(input.type)) {
+            if (typeof input.type !== 'string' || !['text', 'textarea', 'number', 'boolean', 'select', 'path', 'model-select'].includes(input.type)) {
               return false
             }
 
@@ -1067,6 +1419,61 @@ function isWorkbenchNode(value: unknown): boolean {
       }
 
       if (value.emptyText !== undefined && typeof value.emptyText !== 'string') {
+        return false
+      }
+
+      return true
+    }
+    case 'task-status': {
+      if (value.taskId !== undefined && typeof value.taskId !== 'string') {
+        return false
+      }
+
+      if (value.taskType !== undefined && typeof value.taskType !== 'string') {
+        return false
+      }
+
+      if (value.emptyText !== undefined && typeof value.emptyText !== 'string') {
+        return false
+      }
+
+      if (value.controlActions !== undefined) {
+        if (!Array.isArray(value.controlActions)) {
+          return false
+        }
+
+        const valid = value.controlActions.every(
+          (action) => typeof action === 'string' && ['pause', 'resume', 'stop'].includes(action),
+        )
+        if (!valid) {
+          return false
+        }
+      }
+
+      return true
+    }
+    case 'document-chat': {
+      if (typeof value.knowledgeBaseId !== 'string' || value.knowledgeBaseId.trim().length === 0) {
+        return false
+      }
+
+      if (value.sessionId !== undefined && typeof value.sessionId !== 'string') {
+        return false
+      }
+
+      if (value.model !== undefined && typeof value.model !== 'string') {
+        return false
+      }
+
+      if (value.placeholder !== undefined && typeof value.placeholder !== 'string') {
+        return false
+      }
+
+      if (value.emptyText !== undefined && typeof value.emptyText !== 'string') {
+        return false
+      }
+
+      if (value.topK !== undefined && (typeof value.topK !== 'number' || !Number.isFinite(value.topK))) {
         return false
       }
 

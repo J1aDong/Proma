@@ -6,10 +6,11 @@
 
 - 插件 ID：`wiki-local-repository-plugin`
 - capability：`wiki:local-repository`
-- 版本：`0.1.0`
+- 版本：`0.2.0`
 - 权限：
   - `filesystem:read`
   - `filesystem:write`
+  - `llm:invoke`
 
 入口文件：
 
@@ -24,8 +25,11 @@ manifest：
 `invokeCapability("wiki:local-repository", payload)` 支持动作：
 
 - `ping`：连通性测试。
-- `analyze`：分析本地仓库并生成 Wiki。
-- `get-latest`：读取最近一次生成结果。
+- `analyze`：启动宿主 AI 扫描索引任务（可配置模型）。
+- `pause-task`：暂停当前扫描任务。
+- `resume-task`：继续当前扫描任务。
+- `stop-task`：停止当前扫描任务。
+- `get-latest`：读取最近一次 Markdown 与索引摘要。
 
 ## 3. 快速使用（UI）
 
@@ -37,9 +41,10 @@ bun run --cwd "/Users/mr.j/myRoom/code/ai/MyProjects/Proma" dev
 
 2. 进入设置页 -> 插件管理。
 3. 启用 `wiki-local-repository-plugin`。
-4. 在 Wiki 区域选择本地仓库目录。
-5. 点击“分析并生成”。
-6. 点击“读取最新”查看最近报告。
+4. 在 Plugin 工作台选择 Wiki 插件。
+5. 在工具栏输入仓库路径、选择模型并点击“开始分析”。
+6. 在任务状态区执行暂停/继续/停止控制。
+7. 扫描完成后，在“继续聊天（基于文档库）”输入问题并发送。
 
 ## 4. 输入与输出
 
@@ -48,57 +53,63 @@ bun run --cwd "/Users/mr.j/myRoom/code/ai/MyProjects/Proma" dev
 ```json
 {
   "action": "analyze",
-  "repoPath": "/absolute/path/to/local/repo"
+  "repoPath": "/absolute/path/to/local/repo",
+  "model": "claude-sonnet-4-5-20250929",
+  "knowledgeBaseId": "optional-kb-id"
 }
 ```
 
-要求：
+说明：
 
 - `repoPath` 必须存在且是本地目录。
-- 不依赖远程仓库凭证。
+- `model` 可选；为空时由宿主自动选择可用模型。
+- `knowledgeBaseId` 可选；为空时按仓库名称自动推导。
 
-### 4.2 生成输出位置
+### 4.2 主要产物位置
 
-- `~/.proma/plugin-workspaces/wiki-local-repository-plugin/wiki/latest.json`
 - `~/.proma/plugin-workspaces/wiki-local-repository-plugin/wiki/latest.md`
+- `~/.proma/plugin-workspaces/wiki-local-repository-plugin/wiki/latest.json`
+- `~/.proma/plugin-workspaces/wiki-local-repository-plugin/wiki/latest-index-summary.json`
+- `~/.proma/plugin-workspaces/wiki-local-repository-plugin/wiki/knowledge-bases/<knowledgeBaseId>/metadata.json`
+- `~/.proma/plugin-workspaces/wiki-local-repository-plugin/wiki/knowledge-bases/<knowledgeBaseId>/chunks.json`
 
-### 4.3 报告内容（摘要）
+### 4.3 索引元数据契约（摘要）
 
-- 仓库路径与生成时间
-- 目录数量、文件数量、代码文件数量
-- 顶层结构（最多 30 条）
-- 代码文件样本（最多 20 条）
-- 关键文件摘要（如 `README.md`、`package.json`、`go.mod` 等）
-- Markdown Wiki 正文
+- `indexVersion`
+- `model`
+- `chunkStrategy`
+- `repositoryFingerprint`
+- `generatedAt`
+- `totalFiles` / `totalChunks`
+- `reusedChunks` / `rebuiltChunks`
 
-## 5. 行为约束与边界
+## 5. 继续聊天行为
+
+- 会话通过 `pluginId + knowledgeBaseId + sessionId` 隔离。
+- 事件流包含：`delta`、`citation`、`done`、`error`。
+- 当文档库缺失或校验失败时，会返回可诊断错误并引导先完成扫描。
+
+## 6. 行为约束与边界
 
 - 仅处理本地路径。
-- 遍历时默认跳过常见大目录（如 `.git`、`node_modules`、`dist` 等）。
-- 当前遍历深度上限为 8 层。
-- 插件禁用时，能力调用会被宿主拒绝。
+- 扫描流水线由宿主统一实现，插件只负责参数和工作台交互。
+- 插件禁用时，扫描与会话能力调用会被宿主拒绝。
+- `get-latest` 保持兼容，仍可读取 Markdown，同时补充索引摘要。
 
-## 6. 常见问题
+## 7. 常见问题
 
-### Q1：点击“读取最新”提示找不到文件
+### Q1：继续聊天提示“知识库不可用”
 
-通常是还没执行过“分析并生成”。先生成一次，再读取。
+先执行一次 `analyze` 并等待任务完成，再发起聊天。
 
-### Q2：提示 `repoPath 不存在或不是目录`
+### Q2：模型不可用
 
-请确认填写的是本地绝对路径，且目录真实存在。
+检查渠道配置中是否启用了对应模型；不可用模型会被启动前校验拒绝。
 
-### Q3：插件状态不是 `active`
+### Q3：暂停后没有立刻停止当前文件处理
 
-先在插件列表里点击“启用”，状态变为 `active` 后再调用 Wiki 功能。
+扫描采用协作式暂停点，通常会在当前最小处理单元完成后进入 `paused`。
 
-### Q4：禁用后为什么不可用
+### Q4：为什么还有 `get-latest`
 
-这是预期行为：禁用即立刻失效，避免插件在后台继续占用资源。
-
-## 7. 开发扩展建议
-
-- 新增动作时保持 `action` 清晰、输入输出稳定。
-- 长流程中定期调用 `context.lifecycle.throwIfAborted()`。
-- 新增文件产物统一写到插件工作区，不写宿主业务目录。
-- 错误信息尽量可诊断（包含原因和动作上下文）。
+用于兼容旧调用链，同时输出新增索引元数据摘要，便于迁移期间平滑过渡。

@@ -11,6 +11,7 @@ export type PluginPermission =
   | 'llm:invoke'
   | 'mcp:access'
   | 'events:emit'
+  | 'channels:read'
 
 /** 插件生命周期状态 */
 export type PluginLifecycleState =
@@ -118,6 +119,24 @@ export interface PluginLifecycleInput {
   pluginId: string
 }
 
+/** 强制同步内置插件输入 */
+export interface PluginForceSyncBundledInput {
+  pluginId: string
+}
+
+/** 强制同步内置插件结果 */
+export interface PluginForceSyncBundledResult {
+  success: boolean
+  pluginId: string
+  /** 执行阶段：validate/disable/copy/enable/done */
+  stage: 'validate' | 'disable' | 'copy' | 'enable' | 'done'
+  /** 是否执行了运行态重载（先禁用后启用） */
+  reloaded: boolean
+  message?: string
+  error?: string
+  plugin?: PluginRecord
+}
+
 /** 插件能力调用输入 */
 export interface PluginInvokeCapabilityInput {
   pluginId: string
@@ -170,9 +189,11 @@ export type PluginWorkbenchNodeType =
   | 'card'
   | 'toolbar'
   | 'markdown'
+  | 'task-status'
+  | 'document-chat'
 
 /** 工作台动作输入类型 */
-export type PluginWorkbenchActionInputType = 'text' | 'textarea' | 'number' | 'boolean' | 'select' | 'path'
+export type PluginWorkbenchActionInputType = 'text' | 'textarea' | 'number' | 'boolean' | 'select' | 'path' | 'model-select'
 
 /** 工作台动作输入选项（select 类型） */
 export interface PluginWorkbenchActionInputOption {
@@ -280,6 +301,36 @@ export interface PluginWorkbenchMarkdownNode extends PluginWorkbenchBaseNode {
   emptyText?: string
 }
 
+/** 任务运行态节点 */
+export interface PluginWorkbenchTaskStatusNode extends PluginWorkbenchBaseNode {
+  type: 'task-status'
+  /** 关联任务 ID（可选，未提供时显示插件最近任务） */
+  taskId?: string
+  /** 关联任务类型（可选，与 taskId 二选一） */
+  taskType?: string
+  /** 显示控制动作 */
+  controlActions?: PluginTaskControlAction[]
+  /** 空态文案 */
+  emptyText?: string
+}
+
+/** 文档会话节点 */
+export interface PluginWorkbenchDocumentChatNode extends PluginWorkbenchBaseNode {
+  type: 'document-chat'
+  /** 文档库标识 */
+  knowledgeBaseId: string
+  /** 会话标识（可选，缺省则由宿主自动创建） */
+  sessionId?: string
+  /** 默认模型 */
+  model?: string
+  /** 检索条数 */
+  topK?: number
+  /** 输入占位文案 */
+  placeholder?: string
+  /** 空态文案 */
+  emptyText?: string
+}
+
 /** 声明式画布组件树 */
 export type PluginWorkbenchNode =
   | PluginWorkbenchPageNode
@@ -288,6 +339,8 @@ export type PluginWorkbenchNode =
   | PluginWorkbenchCardNode
   | PluginWorkbenchToolbarNode
   | PluginWorkbenchMarkdownNode
+  | PluginWorkbenchTaskStatusNode
+  | PluginWorkbenchDocumentChatNode
 
 /** 插件工作台画布结构 */
 export interface PluginWorkbenchCanvas {
@@ -378,8 +431,231 @@ export interface PluginInvokeWorkbenchActionInput {
 /** 调用工作台动作响应 */
 export type PluginWorkbenchActionInvokeResult = PluginWorkbenchResponse<unknown>
 
+/** 插件任务状态 */
+export type PluginTaskState = 'idle' | 'running' | 'paused' | 'stopped' | 'completed' | 'failed'
+
+/** 插件任务控制动作 */
+export type PluginTaskControlAction = 'pause' | 'resume' | 'stop'
+
+/** 插件任务进度 */
+export interface PluginTaskProgress {
+  /** 当前阶段（如 scan/chunk/embed/persist） */
+  stage: string
+  /** 百分比进度 0-100 */
+  percent: number
+  /** 可读进度描述 */
+  detail?: string
+  /** 已处理数量 */
+  processed?: number
+  /** 总数量 */
+  total?: number
+}
+
+/** 插件任务快照 */
+export interface PluginTaskSnapshot {
+  taskId: string
+  pluginId: string
+  taskType: string
+  state: PluginTaskState
+  progress?: PluginTaskProgress
+  metadata?: Record<string, unknown>
+  result?: Record<string, unknown>
+  error?: string
+  startedAt: string
+  updatedAt: string
+  completedAt?: string
+}
+
+/** 插件任务事件类型 */
+export type PluginTaskEventType =
+  | 'started'
+  | 'progress'
+  | 'paused'
+  | 'resumed'
+  | 'stopped'
+  | 'completed'
+  | 'failed'
+
+/** 插件任务事件 */
+export interface PluginTaskEvent {
+  type: PluginTaskEventType
+  task: PluginTaskSnapshot
+  timestamp: string
+}
+
+/** Wiki 输出语言 */
+export type PluginWikiLanguage = 'zh' | 'en'
+
+/** AI 分析深度 */
+export type PluginAiAnalysisDepth = 'standard' | 'deep'
+
+/** 索引分块策略 */
+export interface PluginAiIndexChunkStrategy {
+  maxChunkChars: number
+  overlapChars: number
+}
+
+/** 索引分块记录 */
+export interface PluginAiIndexChunkRecord {
+  id: string
+  filePath: string
+  fileFingerprint: string
+  chunkIndex: number
+  content: string
+  embedding: number[]
+}
+
+/** 索引元数据 */
+export interface PluginAiIndexMetadata {
+  indexVersion: string
+  pluginId: string
+  knowledgeBaseId: string
+  repositoryPath: string
+  repositoryFingerprint: string
+  model: string
+  language?: PluginWikiLanguage
+  analysisDepth?: PluginAiAnalysisDepth
+  chunkStrategy: PluginAiIndexChunkStrategy
+  generatedAt: string
+  totalFiles: number
+  totalChunks: number
+  reusedChunks: number
+  rebuiltChunks: number
+  fileFingerprints: Record<string, string>
+}
+
+/** 索引摘要 */
+export interface PluginAiIndexSummary {
+  knowledgeBaseId: string
+  metadata: PluginAiIndexMetadata
+  indexPath: string
+  markdownPath: string
+}
+
+/** 启动 AI 扫描任务输入 */
+export interface PluginStartAiIndexingTaskInput {
+  pluginId: string
+  repositoryPath: string
+  knowledgeBaseId?: string
+  model?: string
+  language?: PluginWikiLanguage
+  analysisDepth?: PluginAiAnalysisDepth
+  chunkStrategy?: Partial<PluginAiIndexChunkStrategy>
+}
+
+/** 插件任务控制输入 */
+export interface PluginTaskControlInput {
+  pluginId: string
+  taskId: string
+}
+
+/** 插件任务状态查询输入 */
+export interface PluginTaskStatusInput {
+  pluginId: string
+  taskId: string
+}
+
+/** 插件任务操作响应 */
+export interface PluginTaskOperationResult {
+  success: boolean
+  task?: PluginTaskSnapshot
+  error?: string
+}
+
+/** 文档会话消息角色 */
+export type PluginDocumentChatMessageRole = 'system' | 'user' | 'assistant'
+
+/** 文档会话消息 */
+export interface PluginDocumentChatMessage {
+  role: PluginDocumentChatMessageRole
+  content: string
+  createdAt?: string
+}
+
+/** 文档会话引用 */
+export interface PluginDocumentChatReference {
+  chunkId: string
+  filePath: string
+  score: number
+  snippet: string
+}
+
+/** 文档会话发送输入 */
+export interface PluginDocumentChatSendInput {
+  pluginId: string
+  knowledgeBaseId: string
+  sessionId?: string
+  model?: string
+  messages: PluginDocumentChatMessage[]
+  topK?: number
+}
+
+/** 文档会话发送响应 */
+export interface PluginDocumentChatSendResult {
+  success: boolean
+  pluginId: string
+  knowledgeBaseId: string
+  sessionId: string
+  error?: string
+}
+
+/** 文档会话结束输入 */
+export interface PluginDocumentChatEndInput {
+  pluginId: string
+  knowledgeBaseId: string
+  sessionId: string
+}
+
+/** 文档会话历史查询输入 */
+export interface PluginDocumentChatHistoryInput {
+  pluginId: string
+  knowledgeBaseId: string
+  sessionId: string
+}
+
+/** 文档会话历史响应 */
+export interface PluginDocumentChatHistoryResult {
+  pluginId: string
+  knowledgeBaseId: string
+  sessionId: string
+  messages: PluginDocumentChatMessage[]
+}
+
+/** 文档会话流式事件类型 */
+export type PluginDocumentChatEventType = 'delta' | 'citation' | 'done' | 'error'
+
+/** 文档会话流式事件 */
+export interface PluginDocumentChatEvent {
+  type: PluginDocumentChatEventType
+  pluginId: string
+  knowledgeBaseId: string
+  sessionId: string
+  model?: string
+  delta?: string
+  references?: PluginDocumentChatReference[]
+  message?: PluginDocumentChatMessage
+  error?: string
+  timestamp: string
+}
+
+/** 插件渠道 API 模型信息 */
+export interface PluginChannelModel {
+  /** 模型 ID */
+  id: string
+  /** 模型显示名称 */
+  name: string
+  /** 所属渠道名称 */
+  channelName: string
+}
+
+/** 插件渠道 API 接口 */
+export interface PluginChannelsAPI {
+  /** 获取所有启用渠道的启用模型列表 */
+  getAvailableModels: () => Promise<PluginChannelModel[]>
+}
+
 /**
- * 插件运行时生命周期能力
+ * 插件运行时生命周期管理
  *
  * - `signal`：插件被禁用/卸载时会触发 abort
  * - `onCleanup`：注册资源清理回调，宿主会在禁用时执行
@@ -414,6 +690,7 @@ export interface PluginRuntimeContext {
     events: {
       emit: (event: string, payload?: Record<string, unknown>) => void
     }
+    channels: PluginChannelsAPI
     workbench: {
       /** 从插件工作区读取文本文件 */
       readFile: (path: string) => Promise<string>
@@ -421,6 +698,32 @@ export interface PluginRuntimeContext {
       invokeCapability: (capabilityKey: string, payload?: Record<string, unknown>) => Promise<unknown>
       /** 调用插件工作台动作钩子 */
       invokeAction: (action: PluginWorkbenchActionTrigger) => Promise<PluginWorkbenchActionInvokeResult>
+    }
+    aiIndexing: {
+      /** 启动 AI 扫描与索引任务 */
+      startScan: (
+        input: Omit<PluginStartAiIndexingTaskInput, 'pluginId'>,
+      ) => Promise<PluginTaskOperationResult>
+      /** 暂停任务 */
+      pauseTask: (input: Omit<PluginTaskControlInput, 'pluginId'>) => Promise<PluginTaskOperationResult>
+      /** 继续任务 */
+      resumeTask: (input: Omit<PluginTaskControlInput, 'pluginId'>) => Promise<PluginTaskOperationResult>
+      /** 停止任务 */
+      stopTask: (input: Omit<PluginTaskControlInput, 'pluginId'>) => Promise<PluginTaskOperationResult>
+      /** 查询任务状态 */
+      getTaskStatus: (input: Omit<PluginTaskStatusInput, 'pluginId'>) => Promise<PluginTaskOperationResult>
+      /** 获取最新索引摘要 */
+      getLatestIndexSummary: (knowledgeBaseId?: string) => Promise<PluginAiIndexSummary | null>
+    }
+    documentChat: {
+      /** 发送文档会话消息 */
+      send: (input: Omit<PluginDocumentChatSendInput, 'pluginId'>) => Promise<PluginDocumentChatSendResult>
+      /** 结束文档会话 */
+      endSession: (input: Omit<PluginDocumentChatEndInput, 'pluginId'>) => Promise<{ success: boolean; error?: string }>
+      /** 查询文档会话历史 */
+      getHistory: (
+        input: Omit<PluginDocumentChatHistoryInput, 'pluginId'>,
+      ) => Promise<PluginDocumentChatHistoryResult>
     }
   }
 }
@@ -466,6 +769,8 @@ export const PLUGIN_IPC_CHANNELS = {
   DISABLE: 'plugin:disable',
   /** 卸载插件 */
   UNINSTALL: 'plugin:uninstall',
+  /** 强制同步内置插件（开发者能力） */
+  FORCE_SYNC_BUNDLED: 'plugin:force-sync-bundled',
   /** 获取插件状态 */
   GET_STATUS: 'plugin:get-status',
   /** 调用插件能力 */
@@ -476,4 +781,24 @@ export const PLUGIN_IPC_CHANNELS = {
   WORKBENCH_GET_CANVAS: 'plugin:workbench:get-canvas',
   /** 调用插件工作台动作 */
   WORKBENCH_INVOKE_ACTION: 'plugin:workbench:invoke-action',
+  /** 启动插件 AI 扫描任务 */
+  TASK_START_AI_INDEXING: 'plugin:task:start-ai-indexing',
+  /** 暂停插件任务 */
+  TASK_PAUSE: 'plugin:task:pause',
+  /** 继续插件任务 */
+  TASK_RESUME: 'plugin:task:resume',
+  /** 停止插件任务 */
+  TASK_STOP: 'plugin:task:stop',
+  /** 获取插件任务状态 */
+  TASK_GET_STATUS: 'plugin:task:get-status',
+  /** 插件任务事件流 */
+  TASK_STREAM_EVENT: 'plugin:task:stream:event',
+  /** 发送文档会话消息 */
+  DOC_CHAT_SEND: 'plugin:doc-chat:send',
+  /** 结束文档会话 */
+  DOC_CHAT_END: 'plugin:doc-chat:end',
+  /** 查询文档会话历史 */
+  DOC_CHAT_GET_HISTORY: 'plugin:doc-chat:get-history',
+  /** 文档会话事件流 */
+  DOC_CHAT_STREAM_EVENT: 'plugin:doc-chat:stream:event',
 } as const

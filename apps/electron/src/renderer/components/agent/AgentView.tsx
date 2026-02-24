@@ -704,7 +704,7 @@ export function AgentView(): React.ReactElement {
                     <PermissionModeSelector />
                     <ModelSelector
                       filterChannelId={agentChannelId}
-                      externalSelectedModel={externalSelectedModel}
+                      externalSelectedModelId={externalSelectedModel?.modelId}
                       onModelSelect={handleModelSelect}
                     />
                     <ContextUsageBadge

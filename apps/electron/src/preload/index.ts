@@ -69,6 +69,19 @@ import type {
   PluginWorkbenchCanvasResult,
   PluginWorkbenchListInput,
   PluginWorkbenchListResult,
+  PluginStartAiIndexingTaskInput,
+  PluginTaskControlInput,
+  PluginTaskEvent,
+  PluginTaskOperationResult,
+  PluginTaskStatusInput,
+  PluginDocumentChatSendInput,
+  PluginDocumentChatSendResult,
+  PluginDocumentChatEndInput,
+  PluginDocumentChatHistoryInput,
+  PluginDocumentChatHistoryResult,
+  PluginDocumentChatEvent,
+  PluginForceSyncBundledInput,
+  PluginForceSyncBundledResult,
 } from '@proma/shared'
 import type { UserProfile, AppSettings } from '../types'
 
@@ -258,6 +271,9 @@ export interface ElectronAPI {
   /** 卸载插件 */
   uninstallPlugin: (input: PluginLifecycleInput) => Promise<PluginOperationResult>
 
+  /** 强制同步内置插件 */
+  forceSyncBundledPlugin: (input: PluginForceSyncBundledInput) => Promise<PluginForceSyncBundledResult>
+
   /** 获取插件状态 */
   getPluginStatus: (input: PluginStatusInput) => Promise<PluginStatusResult>
 
@@ -272,6 +288,36 @@ export interface ElectronAPI {
 
   /** 调用插件工作台动作 */
   invokePluginWorkbenchAction: (input: PluginInvokeWorkbenchActionInput) => Promise<PluginWorkbenchActionInvokeResult>
+
+  /** 启动插件 AI 扫描任务 */
+  startPluginAiIndexingTask: (input: PluginStartAiIndexingTaskInput) => Promise<PluginTaskOperationResult>
+
+  /** 暂停插件任务 */
+  pausePluginTask: (input: PluginTaskControlInput) => Promise<PluginTaskOperationResult>
+
+  /** 继续插件任务 */
+  resumePluginTask: (input: PluginTaskControlInput) => Promise<PluginTaskOperationResult>
+
+  /** 停止插件任务 */
+  stopPluginTask: (input: PluginTaskControlInput) => Promise<PluginTaskOperationResult>
+
+  /** 查询插件任务状态 */
+  getPluginTaskStatus: (input: PluginTaskStatusInput) => Promise<PluginTaskOperationResult>
+
+  /** 发送插件文档会话消息 */
+  sendPluginDocumentChat: (input: PluginDocumentChatSendInput) => Promise<PluginDocumentChatSendResult>
+
+  /** 结束插件文档会话 */
+  endPluginDocumentChat: (input: PluginDocumentChatEndInput) => Promise<{ success: boolean; error?: string }>
+
+  /** 查询插件文档会话历史 */
+  getPluginDocumentChatHistory: (input: PluginDocumentChatHistoryInput) => Promise<PluginDocumentChatHistoryResult>
+
+  /** 订阅插件任务流式事件 */
+  onPluginTaskEvent: (callback: (event: PluginTaskEvent) => void) => () => void
+
+  /** 订阅插件文档会话流式事件 */
+  onPluginDocumentChatEvent: (callback: (event: PluginDocumentChatEvent) => void) => () => void
 
   // ===== Agent 会话管理相关 =====
 
@@ -667,6 +713,10 @@ const electronAPI: ElectronAPI = {
     return ipcRenderer.invoke(PLUGIN_IPC_CHANNELS.UNINSTALL, input)
   },
 
+  forceSyncBundledPlugin: (input: PluginForceSyncBundledInput) => {
+    return ipcRenderer.invoke(PLUGIN_IPC_CHANNELS.FORCE_SYNC_BUNDLED, input)
+  },
+
   getPluginStatus: (input: PluginStatusInput) => {
     return ipcRenderer.invoke(PLUGIN_IPC_CHANNELS.GET_STATUS, input)
   },
@@ -685,6 +735,50 @@ const electronAPI: ElectronAPI = {
 
   invokePluginWorkbenchAction: (input: PluginInvokeWorkbenchActionInput) => {
     return ipcRenderer.invoke(PLUGIN_IPC_CHANNELS.WORKBENCH_INVOKE_ACTION, input)
+  },
+
+  startPluginAiIndexingTask: (input: PluginStartAiIndexingTaskInput) => {
+    return ipcRenderer.invoke(PLUGIN_IPC_CHANNELS.TASK_START_AI_INDEXING, input)
+  },
+
+  pausePluginTask: (input: PluginTaskControlInput) => {
+    return ipcRenderer.invoke(PLUGIN_IPC_CHANNELS.TASK_PAUSE, input)
+  },
+
+  resumePluginTask: (input: PluginTaskControlInput) => {
+    return ipcRenderer.invoke(PLUGIN_IPC_CHANNELS.TASK_RESUME, input)
+  },
+
+  stopPluginTask: (input: PluginTaskControlInput) => {
+    return ipcRenderer.invoke(PLUGIN_IPC_CHANNELS.TASK_STOP, input)
+  },
+
+  getPluginTaskStatus: (input: PluginTaskStatusInput) => {
+    return ipcRenderer.invoke(PLUGIN_IPC_CHANNELS.TASK_GET_STATUS, input)
+  },
+
+  sendPluginDocumentChat: (input: PluginDocumentChatSendInput) => {
+    return ipcRenderer.invoke(PLUGIN_IPC_CHANNELS.DOC_CHAT_SEND, input)
+  },
+
+  endPluginDocumentChat: (input: PluginDocumentChatEndInput) => {
+    return ipcRenderer.invoke(PLUGIN_IPC_CHANNELS.DOC_CHAT_END, input)
+  },
+
+  getPluginDocumentChatHistory: (input: PluginDocumentChatHistoryInput) => {
+    return ipcRenderer.invoke(PLUGIN_IPC_CHANNELS.DOC_CHAT_GET_HISTORY, input)
+  },
+
+  onPluginTaskEvent: (callback: (event: PluginTaskEvent) => void) => {
+    const listener = (_: unknown, event: PluginTaskEvent): void => callback(event)
+    ipcRenderer.on(PLUGIN_IPC_CHANNELS.TASK_STREAM_EVENT, listener)
+    return () => { ipcRenderer.removeListener(PLUGIN_IPC_CHANNELS.TASK_STREAM_EVENT, listener) }
+  },
+
+  onPluginDocumentChatEvent: (callback: (event: PluginDocumentChatEvent) => void) => {
+    const listener = (_: unknown, event: PluginDocumentChatEvent): void => callback(event)
+    ipcRenderer.on(PLUGIN_IPC_CHANNELS.DOC_CHAT_STREAM_EVENT, listener)
+    return () => { ipcRenderer.removeListener(PLUGIN_IPC_CHANNELS.DOC_CHAT_STREAM_EVENT, listener) }
   },
 
   // Agent 会话管理

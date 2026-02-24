@@ -1,6 +1,5 @@
 import { existsSync, statSync } from 'node:fs'
-import { readdir, readFile, stat } from 'node:fs/promises'
-import { extname, relative, resolve } from 'node:path'
+import { resolve } from 'node:path'
 
 /** @type {import('@proma/shared').PluginRuntimeContext | null} */
 let runtimeContext = null
@@ -11,6 +10,8 @@ let abortListener = null
 const CAPABILITY_KEY = 'wiki:local-repository'
 const LATEST_JSON_PATH = 'wiki/latest.json'
 const LATEST_MD_PATH = 'wiki/latest.md'
+const LATEST_TASK_PATH = 'wiki/latest-task.json'
+const LATEST_INDEX_SUMMARY_PATH = 'wiki/latest-index-summary.json'
 
 const WORKBENCH_ERROR_CODE = {
   pluginNotActive: 'PLUGIN_NOT_ACTIVE',
@@ -21,7 +22,13 @@ const WORKBENCH_ERROR_CODE = {
 const WORKBENCH_ACTION_ID = {
   analyze: 'analyze',
   getLatest: 'get-latest',
+  pauseTask: 'pause-task',
+  resumeTask: 'resume-task',
+  stopTask: 'stop-task',
 }
+
+const DEFAULT_WIKI_LANGUAGE = 'zh'
+const DEFAULT_ANALYSIS_DEPTH = 'deep'
 
 /**
  * @param {string} code
@@ -52,41 +59,127 @@ async function readWorkspaceFileIfExists(filePath) {
     return null
   }
 }
+
 /**
- * @typedef {{
- *   rootPath: string
- *   generatedAt: string
- *   stats: {
- *     directories: number
- *     files: number
- *     codeFiles: number
- *   }
- *   topLevelEntries: Array<{ name: string, type: 'dir' | 'file' }>
- *   sampleCodeFiles: string[]
- *   keyFiles: Array<{ path: string, preview: string }>
- *   markdown: string
- * }} WikiReport
+ * @param {string} filePath
+ * @returns {Promise<Record<string, unknown> | null>}
  */
+async function readWorkspaceJsonIfExists(filePath) {
+  const raw = await readWorkspaceFileIfExists(filePath)
+  if (!raw) {
+    return null
+  }
 
-const SKIP_DIRS = new Set(['.git', 'node_modules', '.next', 'dist', 'build', '.turbo', '.idea', '.vscode'])
-const CODE_EXTENSIONS = new Set([
-  '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
-  '.go', '.rs', '.py', '.java', '.kt', '.swift',
-  '.dart', '.vue', '.svelte', '.css', '.scss',
-  '.json', '.yaml', '.yml', '.md', '.toml', '.sh'
-])
+  try {
+    return JSON.parse(raw)
+  } catch {
+    return null
+  }
+}
 
-const KEY_FILES = [
-  'README.md',
-  'package.json',
-  'bun.lock',
-  'pnpm-lock.yaml',
-  'yarn.lock',
-  'go.mod',
-  'Cargo.toml',
-  'pubspec.yaml',
-  'tsconfig.json',
-]
+/**
+ * @param {Record<string, unknown>} payload
+ */
+function normalizeModel(payload) {
+  const model = typeof payload.model === 'string' ? payload.model.trim() : ''
+  if (!model || model === '__auto__') {
+    return undefined
+  }
+
+  return model
+}
+
+/**
+ * @param {Record<string, unknown>} payload
+ * @returns {'zh' | 'en'}
+ */
+function normalizeLanguage(payload) {
+  const language = typeof payload.language === 'string' ? payload.language.trim().toLowerCase() : ''
+  if (language === 'en') {
+    return 'en'
+  }
+
+  return DEFAULT_WIKI_LANGUAGE
+}
+
+/**
+ * @param {Record<string, unknown>} payload
+ * @returns {'standard' | 'deep'}
+ */
+function normalizeAnalysisDepth(payload) {
+  const analysisDepth = typeof payload.analysisDepth === 'string' ? payload.analysisDepth.trim().toLowerCase() : ''
+  if (analysisDepth === 'standard') {
+    return 'standard'
+  }
+
+  return DEFAULT_ANALYSIS_DEPTH
+}
+
+/**
+ * @param {Record<string, unknown>} payload
+ * @returns {string}
+ */
+function normalizeRepoPath(payload) {
+  const repoPath = typeof payload.repoPath === 'string' ? payload.repoPath.trim() : ''
+  if (!repoPath) {
+    throw new Error('缺少 repoPath 参数')
+  }
+
+  const resolved = resolve(repoPath)
+  if (!existsSync(resolved) || !statSync(resolved).isDirectory()) {
+    throw new Error('repoPath 不存在或不是目录')
+  }
+
+  return resolved
+}
+
+/**
+ * @param {Record<string, unknown>} payload
+ * @param {Record<string, unknown> | null} latestTask
+ */
+function resolveTaskId(payload, latestTask) {
+  const taskId = typeof payload.taskId === 'string' ? payload.taskId.trim() : ''
+  if (taskId) {
+    return taskId
+  }
+
+  const fallback = latestTask && typeof latestTask.taskId === 'string' ? latestTask.taskId : ''
+  if (!fallback) {
+    throw new Error('缺少 taskId，且没有可用的最近任务')
+  }
+
+  return fallback
+}
+
+/**
+ * @param {Record<string, unknown>} latestTask
+ */
+async function writeLatestTask(latestTask) {
+  if (!runtimeContext) {
+    return
+  }
+
+  await runtimeContext.api.fs.writeText(LATEST_TASK_PATH, JSON.stringify(latestTask, null, 2))
+}
+
+/**
+ * @param {import('@proma/shared').PluginTaskSnapshot | undefined} task
+ */
+function getControlActions(task) {
+  if (!task) {
+    return ['pause', 'resume', 'stop']
+  }
+
+  if (task.state === 'running') {
+    return ['pause', 'stop']
+  }
+
+  if (task.state === 'paused') {
+    return ['resume', 'stop']
+  }
+
+  return ['pause', 'resume', 'stop']
+}
 
 /**
  * 插件激活
@@ -120,7 +213,6 @@ export async function deactivate() {
 
 /**
  * 插件能力调用入口
- * @param {string} capabilityKey
  * @param {Record<string, unknown> | undefined} payload
  * @returns {Promise<unknown>}
  */
@@ -129,7 +221,10 @@ async function runCapabilityAction(payload) {
     throw new Error('插件尚未激活')
   }
 
-  const action = typeof payload?.action === 'string' ? payload.action : WORKBENCH_ACTION_ID.analyze
+  const normalizedPayload = payload ?? {}
+  const action = typeof normalizedPayload.action === 'string'
+    ? normalizedPayload.action
+    : WORKBENCH_ACTION_ID.analyze
 
   if (action === 'ping') {
     return {
@@ -143,29 +238,95 @@ async function runCapabilityAction(payload) {
   if (action === WORKBENCH_ACTION_ID.analyze) {
     runtimeContext.lifecycle.throwIfAborted()
 
-    const repoPath = normalizeRepoPath(payload)
-    const report = await analyzeRepository(repoPath)
+    const repoPath = normalizeRepoPath(normalizedPayload)
+    const model = normalizeModel(normalizedPayload)
+    const language = normalizeLanguage(normalizedPayload)
+    const analysisDepth = normalizeAnalysisDepth(normalizedPayload)
+    const knowledgeBaseId = typeof normalizedPayload.knowledgeBaseId === 'string' && normalizedPayload.knowledgeBaseId.trim()
+      ? normalizedPayload.knowledgeBaseId.trim()
+      : undefined
 
-    runtimeContext.lifecycle.throwIfAborted()
+    const startResult = await runtimeContext.api.aiIndexing.startScan({
+      repositoryPath: repoPath,
+      knowledgeBaseId,
+      model,
+      language,
+      analysisDepth,
+    })
 
-    await runtimeContext.api.fs.writeText(LATEST_JSON_PATH, JSON.stringify(report, null, 2))
-    await runtimeContext.api.fs.writeText(LATEST_MD_PATH, report.markdown)
+    if (!startResult.success || !startResult.task) {
+      throw new Error(startResult.error ?? '启动扫描任务失败')
+    }
+
+    await writeLatestTask({
+      taskId: startResult.task.taskId,
+      taskType: startResult.task.taskType,
+      state: startResult.task.state,
+      repositoryPath: repoPath,
+      knowledgeBaseId: startResult.task.metadata?.knowledgeBaseId,
+      model: startResult.task.metadata?.model,
+      language: startResult.task.metadata?.language,
+      analysisDepth: startResult.task.metadata?.analysisDepth,
+      updatedAt: startResult.task.updatedAt,
+    })
 
     return {
       success: true,
       action: WORKBENCH_ACTION_ID.analyze,
-      report,
+      task: startResult.task,
+    }
+  }
+
+  if (
+    action === WORKBENCH_ACTION_ID.pauseTask
+    || action === WORKBENCH_ACTION_ID.resumeTask
+    || action === WORKBENCH_ACTION_ID.stopTask
+  ) {
+    const latestTask = await readWorkspaceJsonIfExists(LATEST_TASK_PATH)
+    const taskId = resolveTaskId(normalizedPayload, latestTask)
+
+    const result = action === WORKBENCH_ACTION_ID.pauseTask
+      ? await runtimeContext.api.aiIndexing.pauseTask({ taskId })
+      : action === WORKBENCH_ACTION_ID.resumeTask
+        ? await runtimeContext.api.aiIndexing.resumeTask({ taskId })
+        : await runtimeContext.api.aiIndexing.stopTask({ taskId })
+
+    if (!result.success || !result.task) {
+      throw new Error(result.error ?? `任务控制失败: ${action}`)
+    }
+
+    await writeLatestTask({
+      ...(latestTask ?? {}),
+      taskId: result.task.taskId,
+      taskType: result.task.taskType,
+      state: result.task.state,
+      knowledgeBaseId: result.task.metadata?.knowledgeBaseId,
+      model: result.task.metadata?.model,
+      language: result.task.metadata?.language,
+      analysisDepth: result.task.metadata?.analysisDepth,
+      updatedAt: result.task.updatedAt,
+    })
+
+    return {
+      success: true,
+      action,
+      task: result.task,
     }
   }
 
   if (action === WORKBENCH_ACTION_ID.getLatest) {
     runtimeContext.lifecycle.throwIfAborted()
 
-    const stored = await runtimeContext.api.fs.readText(LATEST_JSON_PATH)
+    const summary = await runtimeContext.api.aiIndexing.getLatestIndexSummary()
+    const markdown = await readWorkspaceFileIfExists(LATEST_MD_PATH)
+    const latest = await readWorkspaceJsonIfExists(LATEST_JSON_PATH)
+
     return {
       success: true,
       action: WORKBENCH_ACTION_ID.getLatest,
-      report: JSON.parse(stored),
+      markdown: markdown ?? '',
+      latest,
+      indexSummary: summary,
     }
   }
 
@@ -201,6 +362,20 @@ export async function getWorkbenchCanvas() {
 
   try {
     const latestMarkdown = await readWorkspaceFileIfExists(LATEST_MD_PATH)
+    const latestTask = await readWorkspaceJsonIfExists(LATEST_TASK_PATH)
+    const latestIndexSummary = await readWorkspaceJsonIfExists(LATEST_INDEX_SUMMARY_PATH)
+
+    const taskId = latestTask && typeof latestTask.taskId === 'string' ? latestTask.taskId : undefined
+    const taskStatus = taskId
+      ? await runtimeContext.api.aiIndexing.getTaskStatus({ taskId })
+      : null
+
+    const taskSnapshot = taskStatus?.success ? taskStatus.task : undefined
+    const knowledgeBaseId = latestIndexSummary && typeof latestIndexSummary.knowledgeBaseId === 'string'
+      ? latestIndexSummary.knowledgeBaseId
+      : taskSnapshot?.metadata && typeof taskSnapshot.metadata.knowledgeBaseId === 'string'
+        ? taskSnapshot.metadata.knowledgeBaseId
+        : 'default-kb'
 
     return {
       success: true,
@@ -209,50 +384,142 @@ export async function getWorkbenchCanvas() {
         root: {
           id: 'wiki-root',
           type: 'page',
-          title: '本地仓库 Wiki 工作台',
-          description: '先分析仓库，再查看最新 Markdown 结果。',
+          title: '本地仓库 Wiki 工作台（DeepWiki 能力）',
+          description: '扫描仓库构建索引后，可在同一画布继续聊天。',
           children: [
             {
-              id: 'wiki-toolbar',
-              type: 'toolbar',
-              title: '操作',
-              actions: [
+              id: 'wiki-main-split',
+              type: 'split',
+              direction: 'horizontal',
+              ratios: [1, 2.4],
+              children: [
                 {
-                  id: WORKBENCH_ACTION_ID.analyze,
-                  label: '分析仓库',
-                  description: '扫描本地仓库并生成 wiki/latest.md',
-                  variant: 'primary',
-                  payload: {
-                    action: WORKBENCH_ACTION_ID.analyze,
-                    repoPath: '',
-                  },
-                  inputs: [
+                  id: 'wiki-sidebar',
+                  type: 'panel',
+                  title: '控制与会话',
+                  children: [
                     {
-                      key: 'repoPath',
-                      label: '仓库路径',
-                      type: 'path',
-                      required: true,
-                      placeholder: '请输入本地仓库绝对路径，例如 /Users/me/project',
+                      id: 'wiki-toolbar',
+                      type: 'toolbar',
+                      title: '操作',
+                      actions: [
+                        {
+                          id: WORKBENCH_ACTION_ID.analyze,
+                          label: '开始分析',
+                          description: '启动 AI 扫描任务（分块 -> 向量化 -> 索引）',
+                          variant: 'primary',
+                          payload: {
+                            action: WORKBENCH_ACTION_ID.analyze,
+                            repoPath: '',
+                            model: '__auto__',
+                            language: DEFAULT_WIKI_LANGUAGE,
+                            analysisDepth: DEFAULT_ANALYSIS_DEPTH,
+                            knowledgeBaseId,
+                          },
+                          inputs: [
+                            {
+                              key: 'repoPath',
+                              label: '仓库路径',
+                              type: 'path',
+                              required: true,
+                              placeholder: '请输入本地仓库绝对路径，例如 /Users/me/project',
+                            },
+                            {
+                              key: 'model',
+                              label: '扫描模型',
+                              type: 'model-select',
+                              required: true,
+                              defaultValue: '__auto__',
+                            },
+                            {
+                              key: 'language',
+                              label: '输出语言',
+                              type: 'select',
+                              required: true,
+                              defaultValue: DEFAULT_WIKI_LANGUAGE,
+                              options: [
+                                {
+                                  label: '中文',
+                                  value: 'zh',
+                                },
+                                {
+                                  label: 'English',
+                                  value: 'en',
+                                },
+                              ],
+                            },
+                            {
+                              key: 'analysisDepth',
+                              label: '分析深度',
+                              type: 'select',
+                              required: true,
+                              defaultValue: DEFAULT_ANALYSIS_DEPTH,
+                              options: [
+                                {
+                                  label: '深度',
+                                  value: 'deep',
+                                },
+                                {
+                                  label: '标准',
+                                  value: 'standard',
+                                },
+                              ],
+                            },
+                            {
+                              key: 'knowledgeBaseId',
+                              label: '文档库 ID',
+                              type: 'text',
+                              placeholder: '可选，默认根据仓库名称推导',
+                            },
+                          ],
+                        },
+                        {
+                          id: WORKBENCH_ACTION_ID.getLatest,
+                          label: '读取最新结果',
+                          variant: 'secondary',
+                          payload: {
+                            action: WORKBENCH_ACTION_ID.getLatest,
+                          },
+                        },
+                      ],
+                    },
+                    {
+                      id: 'wiki-task-status',
+                      type: 'task-status',
+                      title: '扫描任务状态',
+                      taskId,
+                      taskType: 'ai-indexing-scan',
+                      controlActions: getControlActions(taskSnapshot),
+                      emptyText: '尚未启动扫描任务。请先执行”开始分析”。',
+                    },
+                    {
+                      id: 'wiki-doc-chat',
+                      type: 'document-chat',
+                      title: '继续聊天（基于文档库）',
+                      knowledgeBaseId,
+                      placeholder: '请输入问题，基于最近扫描结果继续提问...',
+                      emptyText: '完成扫描后即可继续聊天。',
+                      model: latestTask && typeof latestTask.model === 'string' ? latestTask.model : undefined,
+                      topK: 6,
                     },
                   ],
                 },
                 {
-                  id: WORKBENCH_ACTION_ID.getLatest,
-                  label: '读取最新结果',
-                  variant: 'secondary',
-                  payload: {
-                    action: WORKBENCH_ACTION_ID.getLatest,
-                  },
+                  id: 'wiki-main',
+                  type: 'panel',
+                  title: 'Wiki 阅读区',
+                  children: [
+                    {
+                      id: 'wiki-markdown',
+                      type: 'markdown',
+                      title: '最新 Wiki Markdown',
+                      sourcePath: LATEST_MD_PATH,
+                      content: latestMarkdown ?? '',
+                      emptyText: '还没有分析结果，请先执行”开始分析”。',
+                    },
+                  ],
                 },
               ],
-            },
-            {
-              id: 'wiki-markdown',
-              type: 'markdown',
-              title: '最新 Wiki Markdown',
-              sourcePath: LATEST_MD_PATH,
-              content: latestMarkdown ?? '',
-              emptyText: '还没有分析结果，请先执行「分析仓库」。',
             },
           ],
         },
@@ -275,7 +542,13 @@ export async function invokeWorkbenchAction(action) {
   }
 
   const actionId = action?.actionId
-  if (actionId !== WORKBENCH_ACTION_ID.analyze && actionId !== WORKBENCH_ACTION_ID.getLatest) {
+  if (
+    actionId !== WORKBENCH_ACTION_ID.analyze
+    && actionId !== WORKBENCH_ACTION_ID.getLatest
+    && actionId !== WORKBENCH_ACTION_ID.pauseTask
+    && actionId !== WORKBENCH_ACTION_ID.resumeTask
+    && actionId !== WORKBENCH_ACTION_ID.stopTask
+  ) {
     return createWorkbenchError(WORKBENCH_ERROR_CODE.actionInvalid, `不支持的工作台动作: ${String(actionId)}`)
   }
 
@@ -287,12 +560,18 @@ export async function invokeWorkbenchAction(action) {
 
     const result = await runCapabilityAction(payload)
 
+    const message = actionId === WORKBENCH_ACTION_ID.analyze
+      ? '扫描任务已启动，可在状态区查看进度。'
+      : actionId === WORKBENCH_ACTION_ID.getLatest
+        ? '已读取最新结果。'
+        : `任务控制命令已发送：${actionId}`
+
     return {
       success: true,
       data: {
         type: 'toast',
         level: 'success',
-        message: actionId === WORKBENCH_ACTION_ID.analyze ? '仓库分析完成，已生成最新 Markdown。' : '已读取最新分析结果。',
+        message,
         data: result,
       },
     }
@@ -300,213 +579,4 @@ export async function invokeWorkbenchAction(action) {
     const message = error instanceof Error ? error.message : String(error)
     return createWorkbenchError(WORKBENCH_ERROR_CODE.hookFailed, message)
   }
-}
-
-/**
- * @param {Record<string, unknown> | undefined} payload
- * @returns {string}
- */
-function normalizeRepoPath(payload) {
-  const repoPath = typeof payload?.repoPath === 'string' ? payload.repoPath.trim() : ''
-  if (!repoPath) {
-    throw new Error('缺少 repoPath 参数')
-  }
-
-  const resolved = resolve(repoPath)
-  if (!existsSync(resolved) || !statSync(resolved).isDirectory()) {
-    throw new Error('repoPath 不存在或不是目录')
-  }
-
-  return resolved
-}
-
-/**
- * @param {string} rootPath
- * @returns {Promise<WikiReport>}
- */
-async function analyzeRepository(rootPath) {
-  if (!runtimeContext) {
-    throw new Error('插件尚未激活')
-  }
-
-  runtimeContext.lifecycle.throwIfAborted()
-
-  let directories = 0
-  let files = 0
-  let codeFiles = 0
-
-  /** @type {string[]} */
-  const sampleCodeFiles = []
-
-  /** @type {Array<{ name: string, type: 'dir' | 'file' }>} */
-  const topLevelEntries = []
-
-  await walkDirectory(rootPath, async (entryPath, dirent, depth) => {
-    if (depth === 1) {
-      topLevelEntries.push({
-        name: relative(rootPath, entryPath),
-        type: dirent.isDirectory() ? 'dir' : 'file',
-      })
-    }
-
-    if (dirent.isDirectory()) {
-      directories += 1
-      return
-    }
-
-    files += 1
-    const ext = extname(entryPath).toLowerCase()
-    if (CODE_EXTENSIONS.has(ext)) {
-      codeFiles += 1
-      if (sampleCodeFiles.length < 20) {
-        sampleCodeFiles.push(relative(rootPath, entryPath))
-      }
-    }
-  })
-
-  const keyFiles = await collectKeyFiles(rootPath)
-
-  const report = {
-    rootPath,
-    generatedAt: new Date().toISOString(),
-    stats: {
-      directories,
-      files,
-      codeFiles,
-    },
-    topLevelEntries: topLevelEntries.slice(0, 30),
-    sampleCodeFiles,
-    keyFiles,
-    markdown: buildMarkdown({
-      rootPath,
-      directories,
-      files,
-      codeFiles,
-      topLevelEntries,
-      sampleCodeFiles,
-      keyFiles,
-    }),
-  }
-
-  return report
-}
-
-/**
- * @param {string} rootPath
- * @param {(entryPath: string, dirent: import('node:fs').Dirent, depth: number) => Promise<void>} onEntry
- */
-async function walkDirectory(rootPath, onEntry) {
-  /** @type {Array<{ dir: string, depth: number }>} */
-  const queue = [{ dir: rootPath, depth: 0 }]
-
-  while (queue.length > 0) {
-    if (!runtimeContext) {
-      throw new Error('插件尚未激活')
-    }
-
-    runtimeContext.lifecycle.throwIfAborted()
-
-    const current = queue.shift()
-    if (!current) continue
-
-    const entries = await readdir(current.dir, { withFileTypes: true })
-    for (const dirent of entries) {
-      const entryPath = resolve(current.dir, dirent.name)
-
-      if (dirent.isDirectory() && SKIP_DIRS.has(dirent.name)) {
-        continue
-      }
-
-      const depth = current.depth + 1
-      await onEntry(entryPath, dirent, depth)
-
-      if (dirent.isDirectory() && depth < 8) {
-        queue.push({ dir: entryPath, depth })
-      }
-    }
-  }
-}
-
-/**
- * @param {string} rootPath
- */
-async function collectKeyFiles(rootPath) {
-  /** @type {Array<{ path: string, preview: string }>} */
-  const keyFiles = []
-
-  for (const fileName of KEY_FILES) {
-    const filePath = resolve(rootPath, fileName)
-    if (!existsSync(filePath)) {
-      continue
-    }
-
-    const fileInfo = await stat(filePath)
-    if (!fileInfo.isFile()) {
-      continue
-    }
-
-    const content = await readFile(filePath, 'utf-8')
-    const preview = content
-      .split('\n')
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .slice(0, 6)
-      .join('\n')
-
-    keyFiles.push({
-      path: relative(rootPath, filePath),
-      preview: preview.slice(0, 1000),
-    })
-  }
-
-  return keyFiles
-}
-
-/**
- * @param {{
- *   rootPath: string
- *   directories: number
- *   files: number
- *   codeFiles: number
- *   topLevelEntries: Array<{ name: string, type: 'dir' | 'file' }>
- *   sampleCodeFiles: string[]
- *   keyFiles: Array<{ path: string, preview: string }>
- * }} input
- */
-function buildMarkdown(input) {
-  const { rootPath, directories, files, codeFiles, topLevelEntries, sampleCodeFiles, keyFiles } = input
-
-  const topLevelLines = topLevelEntries
-    .slice(0, 20)
-    .map((entry) => `- [${entry.type === 'dir' ? 'DIR' : 'FILE'}] ${entry.name}`)
-    .join('\n')
-
-  const sampleLines = sampleCodeFiles
-    .slice(0, 20)
-    .map((path) => `- ${path}`)
-    .join('\n')
-
-  const keyFileLines = keyFiles
-    .map((item) => {
-      return `### ${item.path}\n\n\`\`\`\n${item.preview}\n\`\`\``
-    })
-    .join('\n\n')
-
-  return [
-    '# 本地仓库 Wiki（V1）',
-    '',
-    `- 目标仓库：\`${rootPath}\``,
-    `- 目录数量：${directories}`,
-    `- 文件数量：${files}`,
-    `- 代码文件数量：${codeFiles}`,
-    '',
-    '## 顶层结构',
-    topLevelLines || '- (空)',
-    '',
-    '## 代码文件样本',
-    sampleLines || '- (无)',
-    '',
-    '## 关键文件摘要',
-    keyFileLines || '暂无关键文件',
-  ].join('\n')
 }
