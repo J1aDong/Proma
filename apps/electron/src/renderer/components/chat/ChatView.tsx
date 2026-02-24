@@ -18,6 +18,7 @@ import { MessageSquare, AlertCircle, X } from 'lucide-react'
 import { ChatHeader } from './ChatHeader'
 import { ChatMessages } from './ChatMessages'
 import { ChatInput } from './ChatInput'
+import { PromptEditorSidebar } from './PromptEditorSidebar'
 import type { InlineEditSubmitPayload } from './ChatMessageItem'
 import {
   currentConversationIdAtom,
@@ -36,6 +37,8 @@ import {
   chatStreamErrorsAtom,
   currentChatErrorAtom,
 } from '@/atoms/chat-atoms'
+import { resolvedSystemMessageAtom, promptSidebarOpenAtom } from '@/atoms/system-prompt-atoms'
+import { cn } from '@/lib/utils'
 import type { ConversationStreamState } from '@/atoms/chat-atoms'
 import type {
   ChatSendInput,
@@ -44,6 +47,7 @@ import type {
   StreamReasoningEvent,
   StreamCompleteEvent,
   StreamErrorEvent,
+  StreamToolActivityEvent,
   FileAttachment,
   AttachmentSaveInput,
 } from '@proma/shared'
@@ -63,6 +67,8 @@ export function ChatView(): React.ReactElement {
   const setChatStreamErrors = useSetAtom(chatStreamErrorsAtom)
   const chatError = useAtomValue(currentChatErrorAtom)
   const isStreaming = useAtomValue(streamingAtom)
+  const resolvedSystemMessage = useAtomValue(resolvedSystemMessageAtom)
+  const promptSidebarOpen = useAtomValue(promptSidebarOpenAtom)
   const [inlineEditingMessageId, setInlineEditingMessageId] = React.useState<string | null>(null)
 
   // 首条消息标题生成相关 ref（支持多对话并行）
@@ -120,7 +126,7 @@ export function ChatView(): React.ReactElement {
       updater: (prev: ConversationStreamState) => ConversationStreamState
     ): void => {
       setStreamingStates((prev) => {
-        const current = prev.get(convId) ?? { streaming: false, content: '', reasoning: '', model: undefined }
+        const current = prev.get(convId) ?? { streaming: false, content: '', reasoning: '', model: undefined, toolActivities: [] }
         const next = updater(current)
         const map = new Map(prev)
         map.set(convId, next)
@@ -230,11 +236,21 @@ export function ChatView(): React.ReactElement {
       }
     )
 
+    const cleanupToolActivity = window.electronAPI.onStreamToolActivity(
+      (event: StreamToolActivityEvent) => {
+        updateState(event.conversationId, (s) => ({
+          ...s,
+          toolActivities: [...s.toolActivities, event.activity],
+        }))
+      }
+    )
+
     return () => {
       cleanupChunk()
       cleanupReasoning()
       cleanupComplete()
       cleanupError()
+      cleanupToolActivity()
     }
   }, [
     setStreamingStates,
@@ -337,6 +353,7 @@ export function ChatView(): React.ReactElement {
         content: '',
         reasoning: '',
         model: selectedModel.modelId,
+        toolActivities: [],
       })
       return map
     })
@@ -351,6 +368,7 @@ export function ChatView(): React.ReactElement {
       contextDividers: options?.contextDividersOverride ?? contextDividers,
       attachments: savedAttachments.length > 0 ? savedAttachments : undefined,
       thinkingEnabled: thinkingEnabled || undefined,
+      systemMessage: resolvedSystemMessage,
     }
 
     // 乐观更新：立即在 UI 中显示用户消息
@@ -382,6 +400,7 @@ export function ChatView(): React.ReactElement {
     contextLength,
     contextDividers,
     thinkingEnabled,
+    resolvedSystemMessage,
     setChatStreamErrors,
     setPendingAttachments,
     setStreamingStates,
@@ -602,50 +621,67 @@ export function ChatView(): React.ReactElement {
   }
 
   return (
-    <div className="flex flex-col h-full w-full max-w-[min(72rem,100%)] mx-auto overflow-hidden">
-      {/* 头部：对话标题 + 并排模式切换 */}
-      <ChatHeader />
+    <div className="flex h-full overflow-hidden">
+      {/* 主内容区域 */}
+      <div className="flex flex-col h-full flex-1 min-w-0">
+        {/* Header 在 max-w 外，按钮可到达最右侧 */}
+        <ChatHeader />
+        <div className="flex flex-col flex-1 w-full max-w-[min(72rem,100%)] mx-auto overflow-hidden min-h-0">
+          {/* 中间：消息区域 */}
+          <ChatMessages
+            onDeleteMessage={handleDeleteMessage}
+            onResendMessage={handleResendMessage}
+            onStartInlineEdit={handleStartInlineEdit}
+            onSubmitInlineEdit={handleSubmitInlineEdit}
+            onCancelInlineEdit={handleCancelInlineEdit}
+            inlineEditingMessageId={inlineEditingMessageId}
+            onDeleteDivider={handleDeleteDivider}
+            onLoadMore={handleLoadMore}
+          />
 
-      {/* 中间：消息区域 */}
-      <ChatMessages
-        onDeleteMessage={handleDeleteMessage}
-        onResendMessage={handleResendMessage}
-        onStartInlineEdit={handleStartInlineEdit}
-        onSubmitInlineEdit={handleSubmitInlineEdit}
-        onCancelInlineEdit={handleCancelInlineEdit}
-        inlineEditingMessageId={inlineEditingMessageId}
-        onDeleteDivider={handleDeleteDivider}
-        onLoadMore={handleLoadMore}
-      />
+          {/* 错误提示 */}
+          {chatError && (
+            <div className="mx-4 mb-2 px-4 py-2.5 rounded-lg bg-destructive/10 text-destructive text-sm flex items-center gap-2">
+              <AlertCircle className="size-4 shrink-0" />
+              <span className="flex-1 break-all">{chatError}</span>
+              <button
+                type="button"
+                className="shrink-0 p-0.5 rounded hover:bg-destructive/10 transition-colors"
+                onClick={() => {
+                  if (!currentConversationId) return
+                  setChatStreamErrors((prev) => {
+                    const map = new Map(prev)
+                    map.delete(currentConversationId)
+                    return map
+                  })
+                }}
+              >
+                <X className="size-3.5" />
+              </button>
+            </div>
+          )}
 
-      {/* 错误提示 */}
-      {chatError && (
-        <div className="mx-4 mb-2 px-4 py-2.5 rounded-lg bg-destructive/10 text-destructive text-sm flex items-center gap-2">
-          <AlertCircle className="size-4 shrink-0" />
-          <span className="flex-1 break-all">{chatError}</span>
-          <button
-            type="button"
-            className="shrink-0 p-0.5 rounded hover:bg-destructive/10 transition-colors"
-            onClick={() => {
-              if (!currentConversationId) return
-              setChatStreamErrors((prev) => {
-                const map = new Map(prev)
-                map.delete(currentConversationId)
-                return map
-              })
-            }}
-          >
-            <X className="size-3.5" />
-          </button>
+          {/* 底部：输入框 */}
+          <ChatInput
+            onSend={handleSend}
+            onStop={handleStop}
+            onClearContext={handleClearContext}
+          />
         </div>
-      )}
+      </div>
 
-      {/* 底部：输入框 */}
-      <ChatInput
-        onSend={handleSend}
-        onStop={handleStop}
-        onClearContext={handleClearContext}
-      />
+      {/* 提示词编辑侧栏 */}
+      <div className={cn(
+        'relative flex-shrink-0 transition-[width] duration-300 ease-in-out overflow-hidden titlebar-drag-region',
+        promptSidebarOpen ? 'w-[300px] border-l' : 'w-10'
+      )}>
+        <div className={cn(
+          'w-[300px] h-full transition-opacity duration-200 titlebar-no-drag',
+          promptSidebarOpen ? 'opacity-100' : 'opacity-0 pointer-events-none'
+        )}>
+          <PromptEditorSidebar />
+        </div>
+      </div>
     </div>
   )
 }

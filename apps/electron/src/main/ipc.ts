@@ -5,7 +5,18 @@
  */
 
 import { ipcMain, nativeTheme, shell, dialog, BrowserWindow } from 'electron'
-import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, PLUGIN_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS } from '@proma/shared'
+import {
+  IPC_CHANNELS,
+  CHANNEL_IPC_CHANNELS,
+  CHAT_IPC_CHANNELS,
+  AGENT_IPC_CHANNELS,
+  PLUGIN_IPC_CHANNELS,
+  ENVIRONMENT_IPC_CHANNELS,
+  PROXY_IPC_CHANNELS,
+  GITHUB_RELEASE_IPC_CHANNELS,
+  SYSTEM_PROMPT_IPC_CHANNELS,
+  MEMORY_IPC_CHANNELS,
+} from '@proma/shared'
 import { USER_PROFILE_IPC_CHANNELS, SETTINGS_IPC_CHANNELS } from '../types'
 import type {
   RuntimeStatus,
@@ -74,6 +85,11 @@ import type {
   PluginDocumentChatEvent,
   PluginForceSyncBundledInput,
   PluginForceSyncBundledResult,
+  SystemPromptConfig,
+  SystemPrompt,
+  SystemPromptCreateInput,
+  SystemPromptUpdateInput,
+  MemoryConfig,
 } from '@proma/shared'
 import type { UserProfile, AppSettings } from '../types'
 import { getRuntimeStatus, getGitRepoStatus } from './lib/runtime-init'
@@ -138,6 +154,15 @@ import {
   getWorkspacePermissionMode,
   setWorkspacePermissionMode,
 } from './lib/agent-workspace-manager'
+import { getMemoryConfig, setMemoryConfig } from './lib/memory-service'
+import {
+  getSystemPromptConfig,
+  createSystemPrompt,
+  updateSystemPrompt,
+  deleteSystemPrompt,
+  updateAppendSetting,
+  setDefaultPrompt,
+} from './lib/system-prompt-manager'
 import {
   listPlugins,
   listPluginWorkbenches,
@@ -978,6 +1003,43 @@ export function registerIpcHandlers(): void {
     }
   )
 
+  // 全局记忆配置
+  ipcMain.handle(
+    MEMORY_IPC_CHANNELS.GET_CONFIG,
+    async (): Promise<MemoryConfig> => {
+      return getMemoryConfig()
+    }
+  )
+
+  ipcMain.handle(
+    MEMORY_IPC_CHANNELS.SET_CONFIG,
+    async (_, config: MemoryConfig): Promise<void> => {
+      setMemoryConfig(config)
+    }
+  )
+
+  ipcMain.handle(
+    MEMORY_IPC_CHANNELS.TEST_CONNECTION,
+    async (): Promise<{ success: boolean; message: string }> => {
+      const config = getMemoryConfig()
+      if (!config.apiKey) {
+        return { success: false, message: '请先填写 API Key' }
+      }
+      try {
+        const { searchMemory } = await import('./lib/memos-client')
+        const result = await searchMemory(
+          { apiKey: config.apiKey, userId: config.userId?.trim() || 'proma-user', baseUrl: config.baseUrl },
+          'test connection',
+          1,
+        )
+        return { success: true, message: `连接成功，已检索到 ${result.facts.length} 条事实、${result.preferences.length} 条偏好` }
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error)
+        return { success: false, message: `连接失败: ${msg}` }
+      }
+    }
+  )
+
   // ===== AskUserQuestion 交互式问答 =====
 
   // 响应 AskUser 请求
@@ -1133,6 +1195,56 @@ export function registerIpcHandlers(): void {
       }
 
       shell.showItemInFolder(safePath)
+    }
+  )
+
+  // ===== 系统提示词管理 =====
+
+  // 获取系统提示词配置
+  ipcMain.handle(
+    SYSTEM_PROMPT_IPC_CHANNELS.GET_CONFIG,
+    async (): Promise<SystemPromptConfig> => {
+      return getSystemPromptConfig()
+    }
+  )
+
+  // 创建提示词
+  ipcMain.handle(
+    SYSTEM_PROMPT_IPC_CHANNELS.CREATE,
+    async (_, input: SystemPromptCreateInput): Promise<SystemPrompt> => {
+      return createSystemPrompt(input)
+    }
+  )
+
+  // 更新提示词
+  ipcMain.handle(
+    SYSTEM_PROMPT_IPC_CHANNELS.UPDATE,
+    async (_, id: string, input: SystemPromptUpdateInput): Promise<SystemPrompt> => {
+      return updateSystemPrompt(id, input)
+    }
+  )
+
+  // 删除提示词
+  ipcMain.handle(
+    SYSTEM_PROMPT_IPC_CHANNELS.DELETE,
+    async (_, id: string): Promise<void> => {
+      return deleteSystemPrompt(id)
+    }
+  )
+
+  // 更新追加日期时间和用户名开关
+  ipcMain.handle(
+    SYSTEM_PROMPT_IPC_CHANNELS.UPDATE_APPEND_SETTING,
+    async (_, enabled: boolean): Promise<void> => {
+      return updateAppendSetting(enabled)
+    }
+  )
+
+  // 设置默认提示词
+  ipcMain.handle(
+    SYSTEM_PROMPT_IPC_CHANNELS.SET_DEFAULT,
+    async (_, id: string | null): Promise<void> => {
+      return setDefaultPrompt(id)
     }
   )
 

@@ -6,7 +6,18 @@
  */
 
 import { contextBridge, ipcRenderer } from 'electron'
-import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, PLUGIN_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS } from '@proma/shared'
+import {
+  IPC_CHANNELS,
+  CHANNEL_IPC_CHANNELS,
+  CHAT_IPC_CHANNELS,
+  AGENT_IPC_CHANNELS,
+  PLUGIN_IPC_CHANNELS,
+  ENVIRONMENT_IPC_CHANNELS,
+  PROXY_IPC_CHANNELS,
+  GITHUB_RELEASE_IPC_CHANNELS,
+  SYSTEM_PROMPT_IPC_CHANNELS,
+  MEMORY_IPC_CHANNELS,
+} from '@proma/shared'
 import { USER_PROFILE_IPC_CHANNELS, SETTINGS_IPC_CHANNELS } from '../types'
 import type {
   RuntimeStatus,
@@ -25,6 +36,7 @@ import type {
   StreamReasoningEvent,
   StreamCompleteEvent,
   StreamErrorEvent,
+  StreamToolActivityEvent,
   AttachmentSaveInput,
   AttachmentSaveResult,
   FileDialogResult,
@@ -33,6 +45,7 @@ import type {
   AgentMessage,
   AgentSendInput,
   AgentStreamEvent,
+  AgentStreamCompletePayload,
   AgentWorkspace,
   AgentGenerateTitleInput,
   AgentSaveFilesInput,
@@ -82,6 +95,11 @@ import type {
   PluginDocumentChatEvent,
   PluginForceSyncBundledInput,
   PluginForceSyncBundledResult,
+  SystemPromptConfig,
+  SystemPrompt,
+  SystemPromptCreateInput,
+  SystemPromptUpdateInput,
+  MemoryConfig,
 } from '@proma/shared'
 import type { UserProfile, AppSettings } from '../types'
 
@@ -319,6 +337,9 @@ export interface ElectronAPI {
   /** 订阅插件文档会话流式事件 */
   onPluginDocumentChatEvent: (callback: (event: PluginDocumentChatEvent) => void) => () => void
 
+  /** 订阅流式工具活动事件 */
+  onStreamToolActivity: (callback: (event: StreamToolActivityEvent) => void) => () => void
+
   // ===== Agent 会话管理相关 =====
 
   /** 获取 Agent 会话列表 */
@@ -391,7 +412,7 @@ export interface ElectronAPI {
   onAgentStreamEvent: (callback: (event: AgentStreamEvent) => void) => () => void
 
   /** 订阅 Agent 流式完成事件 */
-  onAgentStreamComplete: (callback: (data: { sessionId: string }) => void) => () => void
+  onAgentStreamComplete: (callback: (data: AgentStreamCompletePayload) => void) => () => void
 
   /** 订阅 Agent 流式错误事件 */
   onAgentStreamError: (callback: (data: { sessionId: string; error: string }) => void) => () => void
@@ -409,6 +430,15 @@ export interface ElectronAPI {
 
   /** 设置工作区权限模式 */
   setPermissionMode: (workspaceSlug: string, mode: PromaPermissionMode) => Promise<void>
+
+  /** 获取全局记忆配置 */
+  getMemoryConfig: () => Promise<MemoryConfig>
+
+  /** 保存全局记忆配置 */
+  setMemoryConfig: (config: MemoryConfig) => Promise<void>
+
+  /** 测试记忆连接 */
+  testMemoryConnection: () => Promise<{ success: boolean; message: string }>
 
   /** 订阅权限请求事件（返回清理函数） */
   onPermissionRequest: (callback: (data: { sessionId: string; request: PermissionRequest }) => void) => () => void
@@ -449,6 +479,26 @@ export interface ElectronAPI {
   /** 在系统文件管理器中显示文件 */
   showInFolder: (filePath: string) => Promise<void>
 
+  // ===== 系统提示词管理 =====
+
+  /** 获取系统提示词配置 */
+  getSystemPromptConfig: () => Promise<SystemPromptConfig>
+
+  /** 创建提示词 */
+  createSystemPrompt: (input: SystemPromptCreateInput) => Promise<SystemPrompt>
+
+  /** 更新提示词 */
+  updateSystemPrompt: (id: string, input: SystemPromptUpdateInput) => Promise<SystemPrompt>
+
+  /** 删除提示词 */
+  deleteSystemPrompt: (id: string) => Promise<void>
+
+  /** 更新追加日期时间和用户名开关 */
+  updateAppendSetting: (enabled: boolean) => Promise<void>
+
+  /** 设置默认提示词 */
+  setDefaultPrompt: (id: string | null) => Promise<void>
+
   // ===== 自动更新相关（可选，仅在 updater 模块存在时可用） =====
 
   /** 更新 API */
@@ -457,14 +507,14 @@ export interface ElectronAPI {
     downloadUpdate: () => Promise<void>
     installUpdate: () => Promise<void>
     getStatus: () => Promise<{
-      status: 'idle' | 'checking' | 'available' | 'not-available' | 'downloading' | 'downloaded' | 'error'
+      status: 'idle' | 'checking' | 'available' | 'not-available' | 'downloading' | 'downloaded' | 'installing' | 'error'
       version?: string
       releaseNotes?: string
       progress?: { percent: number; transferred: number; total: number }
       error?: string
     }>
     onStatusChanged: (callback: (status: {
-      status: 'idle' | 'checking' | 'available' | 'not-available' | 'downloading' | 'downloaded' | 'error'
+      status: 'idle' | 'checking' | 'available' | 'not-available' | 'downloading' | 'downloaded' | 'installing' | 'error'
       version?: string
       releaseNotes?: string
       progress?: { percent: number; transferred: number; total: number }
@@ -781,6 +831,12 @@ const electronAPI: ElectronAPI = {
     return () => { ipcRenderer.removeListener(PLUGIN_IPC_CHANNELS.DOC_CHAT_STREAM_EVENT, listener) }
   },
 
+  onStreamToolActivity: (callback: (event: StreamToolActivityEvent) => void) => {
+    const listener = (_: unknown, event: StreamToolActivityEvent): void => callback(event)
+    ipcRenderer.on(CHAT_IPC_CHANNELS.STREAM_TOOL_ACTIVITY, listener)
+    return () => { ipcRenderer.removeListener(CHAT_IPC_CHANNELS.STREAM_TOOL_ACTIVITY, listener) }
+  },
+
   // Agent 会话管理
   listAgentSessions: () => {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.LIST_SESSIONS)
@@ -871,8 +927,8 @@ const electronAPI: ElectronAPI = {
     return () => { ipcRenderer.removeListener(AGENT_IPC_CHANNELS.STREAM_EVENT, listener) }
   },
 
-  onAgentStreamComplete: (callback: (data: { sessionId: string }) => void) => {
-    const listener = (_: unknown, data: { sessionId: string }): void => callback(data)
+  onAgentStreamComplete: (callback: (data: AgentStreamCompletePayload) => void) => {
+    const listener = (_: unknown, data: AgentStreamCompletePayload): void => callback(data)
     ipcRenderer.on(AGENT_IPC_CHANNELS.STREAM_COMPLETE, listener)
     return () => { ipcRenderer.removeListener(AGENT_IPC_CHANNELS.STREAM_COMPLETE, listener) }
   },
@@ -901,6 +957,18 @@ const electronAPI: ElectronAPI = {
 
   setPermissionMode: (workspaceSlug: string, mode: PromaPermissionMode) => {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.SET_PERMISSION_MODE, workspaceSlug, mode)
+  },
+
+  getMemoryConfig: () => {
+    return ipcRenderer.invoke(MEMORY_IPC_CHANNELS.GET_CONFIG)
+  },
+
+  setMemoryConfig: (config: MemoryConfig) => {
+    return ipcRenderer.invoke(MEMORY_IPC_CHANNELS.SET_CONFIG, config)
+  },
+
+  testMemoryConnection: () => {
+    return ipcRenderer.invoke(MEMORY_IPC_CHANNELS.TEST_CONNECTION)
   },
 
   onPermissionRequest: (callback: (data: { sessionId: string; request: PermissionRequest }) => void) => {
@@ -965,6 +1033,31 @@ const electronAPI: ElectronAPI = {
 
   showInFolder: (filePath: string) => {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.SHOW_IN_FOLDER, filePath)
+  },
+
+  // 系统提示词管理
+  getSystemPromptConfig: () => {
+    return ipcRenderer.invoke(SYSTEM_PROMPT_IPC_CHANNELS.GET_CONFIG)
+  },
+
+  createSystemPrompt: (input: SystemPromptCreateInput) => {
+    return ipcRenderer.invoke(SYSTEM_PROMPT_IPC_CHANNELS.CREATE, input)
+  },
+
+  updateSystemPrompt: (id: string, input: SystemPromptUpdateInput) => {
+    return ipcRenderer.invoke(SYSTEM_PROMPT_IPC_CHANNELS.UPDATE, id, input)
+  },
+
+  deleteSystemPrompt: (id: string) => {
+    return ipcRenderer.invoke(SYSTEM_PROMPT_IPC_CHANNELS.DELETE, id)
+  },
+
+  updateAppendSetting: (enabled: boolean) => {
+    return ipcRenderer.invoke(SYSTEM_PROMPT_IPC_CHANNELS.UPDATE_APPEND_SETTING, enabled)
+  },
+
+  setDefaultPrompt: (id: string | null) => {
+    return ipcRenderer.invoke(SYSTEM_PROMPT_IPC_CHANNELS.SET_DEFAULT, id)
   },
 
   // 自动更新（updater 模块为可选，bridge 始终暴露，IPC 调用失败时由渲染进程处理）
