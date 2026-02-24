@@ -81,6 +81,81 @@ bun run build:resources   # 复制 resources/ 到 dist/
 bun run generate:icons    # 生成应用图标
 ```
 
+## Electron 前端 AI 调试（MCP）
+
+### 适用场景
+
+用于调试 Proma 前端 UI 交互、样式、事件、网络、性能问题。推荐区分两类工具：
+
+- `playwright` MCP：流程复现与回归验证
+- `chrome-devtools` MCP：根因定位（DOM/CSS/Console/Network/Performance）
+
+### 前置条件
+
+- 本机已安装并启用 `playwright` 与 `chrome-devtools` 两个 MCP
+- Proma 处于开发模式运行：`bun run dev`
+
+### Electron 渲染调试端口约定
+
+- 默认端口：`9222`
+- 环境变量：`PROMA_REMOTE_DEBUG_PORT`（可覆盖默认端口）
+- 验证地址：`http://127.0.0.1:9222/json/version` 返回 JSON 视为可用
+
+### 标准调试流程（强制顺序）
+
+1. 使用 Playwright MCP 复现问题，记录操作路径和失败步骤
+2. 使用 Chrome DevTools MCP 定位根因（DOM/CSS/Console/Network/Performance）
+3. 修复问题后，再用 Playwright MCP 做回归验证
+4. 输出结果必须包含：复现步骤 + 根因 + 修复点 + 回归结果
+
+### 推荐提示词模板
+
+**复现模板（Playwright MCP）**
+
+```text
+请使用 Playwright MCP 连接当前 Proma 前端页面，按以下步骤复现问题：
+1) <步骤1>
+2) <步骤2>
+3) <步骤3>
+
+输出：
+- 实际执行路径
+- 失败发生在第几步
+- 页面状态截图/关键节点信息
+```
+
+**定位模板（Chrome DevTools MCP）**
+
+```text
+请使用 chrome-devtools MCP 检查当前问题页面，重点分析：
+- 目标元素的 DOM 结构与 CSS 计算结果
+- 相关事件监听与触发链路
+- Console 报错
+- Network 请求状态与响应
+
+输出：
+- 根因判断
+- 最小修复建议（具体到组件/样式/逻辑点）
+```
+
+**回归模板（Playwright MCP）**
+
+```text
+请使用 Playwright MCP 按以下用例回归，并输出通过/失败：
+1) <回归用例1>
+2) <回归用例2>
+3) <回归用例3>
+
+输出：
+- 每条用例结果
+- 若失败，给出失败步骤与期望/实际差异
+```
+
+### 常见坑
+
+- MCP 连接的是浏览器上下文，不自动等于 Electron 主渲染窗口；必须确认 CDP 端口和 target
+- 优先选择主窗口 target，避免误连到 DevTools 自身页面
+
 ## 运行时环境
 
 使用 Bun 代替 Node.js/npm/pnpm：

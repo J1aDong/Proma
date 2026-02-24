@@ -14,6 +14,7 @@ import { startWorkspaceWatcher, stopWorkspaceWatcher } from './lib/workspace-wat
 import { getIsQuitting, setQuitting, isUpdating } from './lib/app-lifecycle'
 
 let mainWindow: BrowserWindow | null = null
+const DEFAULT_REMOTE_DEBUG_PORT = 9222
 
 /**
  * 检查窗口是否在可用显示器范围内
@@ -148,6 +149,40 @@ function createWindow(): void {
     mainWindow = null
   })
 }
+
+/**
+ * 开发态启用 Electron 渲染进程远程调试端口（CDP）
+ *
+ * 仅开发模式启用，生产模式始终关闭。
+ * 默认端口 9222，可通过 PROMA_REMOTE_DEBUG_PORT 覆盖。
+ * 可通过 PROMA_REMOTE_DEBUG_ENABLED=0 显式禁用。
+ */
+function enableRemoteDebuggingForDev(): void {
+  if (app.isPackaged) return
+
+  if (process.env.PROMA_REMOTE_DEBUG_ENABLED === '0') {
+    console.log('[调试] 已禁用 remote-debugging-port（PROMA_REMOTE_DEBUG_ENABLED=0）')
+    return
+  }
+
+  const rawPort = process.env.PROMA_REMOTE_DEBUG_PORT?.trim()
+  let port = DEFAULT_REMOTE_DEBUG_PORT
+
+  if (rawPort) {
+    const parsed = Number.parseInt(rawPort, 10)
+    if (Number.isInteger(parsed) && parsed >= 1 && parsed <= 65535) {
+      port = parsed
+    } else {
+      console.warn(`[调试] 无效 PROMA_REMOTE_DEBUG_PORT: ${rawPort}，回退默认端口 ${DEFAULT_REMOTE_DEBUG_PORT}`)
+    }
+  }
+
+  app.commandLine.appendSwitch('remote-debugging-port', String(port))
+  console.log(`[调试] Electron 渲染进程 CDP 端口已启用: http://127.0.0.1:${port}`)
+}
+
+// 尽早设置命令行参数，确保渲染进程启动时生效
+enableRemoteDebuggingForDev()
 
 app.whenReady().then(async () => {
   // 初始化运行时环境（Shell 环境 + Bun + Git 检测）

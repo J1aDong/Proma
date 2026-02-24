@@ -20,9 +20,41 @@ mock.module('@proma/core', () => {
       const prompt = args.request.userMessage ?? ''
       capturedSummaryPrompts.push(prompt)
 
-      const delta = prompt.includes('English')
-        ? '## Repository Insight\n\n```mermaid\ngraph TD\nRepo-->Module\n```'
-        : '## 仓库洞察\n\n```mermaid\ngraph TD\n仓库-->模块\n```'
+      let delta = ''
+      if (prompt.includes('输出 JSON schema') || prompt.includes('output JSON schema')) {
+        delta = JSON.stringify({
+          core: ['README.md', 'src/index.ts'],
+          supporting: ['src/worker.ts'],
+          peripheral: [],
+          modules: [
+            {
+              name: 'core-runtime',
+              files: ['src/index.ts', 'src/worker.ts'],
+            },
+          ],
+        })
+      } else if (prompt.includes('schema:') && prompt.includes('"summary": string')) {
+        delta = JSON.stringify({
+          summary: '模块负责核心运行链路与任务调度。',
+          keyFlows: ['初始化 -> 任务分发 -> 结果汇总'],
+          risks: ['错误恢复路径覆盖不足'],
+          evidence: ['src/index.ts', 'src/worker.ts'],
+        })
+      } else if (prompt.includes('主文档 Agent') && prompt.includes('"pages"')) {
+        delta = JSON.stringify({
+          pages: [
+            { id: 'index', content: '# 仓库 Wiki\n\n## 覆盖范围\n- core: 2\n- supporting: 1' },
+            { id: 'architecture', content: '# 架构总览\n\n```mermaid\ngraph TD\nRepo-->Core\n```' },
+            { id: 'runtime', content: '# 运行链路\n\n## 关键执行流\n- 初始化 -> 运行' },
+            { id: 'modules', content: '# 模块明细\n\n| 模块 | 职责 |\n| --- | --- |\n| core-runtime | 调度 |' },
+            { id: 'data-risks', content: '# 数据与风险\n\n## 证据索引\n- src/index.ts' },
+          ],
+        })
+      } else {
+        delta = prompt.includes('English')
+          ? '## Repository Insight\n\n```mermaid\ngraph TD\nRepo-->Module\n```'
+          : '## 仓库洞察\n\n```mermaid\ngraph TD\n仓库-->模块\n```'
+      }
 
       args.onEvent({ type: 'chunk', delta })
       args.onEvent({ type: 'done' })
@@ -106,6 +138,8 @@ describe('ai-indexing-service', () => {
         model: 'test-model',
         language: 'zh',
         analysisDepth: 'standard',
+        subagentCount: 4,
+        scanMode: 'smart',
       },
     })
 
@@ -118,6 +152,17 @@ describe('ai-indexing-service', () => {
     expect(firstIndex.metadata.totalFiles).toBeGreaterThan(0)
     expect(firstIndex.metadata.totalChunks).toBeGreaterThan(0)
     expect(firstIndex.metadata.reusedChunks).toBe(0)
+    expect(capturedSummaryPrompts.length).toBeGreaterThan(0)
+    expect(capturedSummaryPrompts.some((prompt) => prompt.includes('输出 JSON schema'))).toBe(true)
+    expect(capturedSummaryPrompts.some((prompt) => prompt.includes('子分析 Agent'))).toBe(true)
+    const latestMarkdown = await readFile(join(workspaceRoot, 'wiki', 'latest.md'), 'utf-8')
+    expect(latestMarkdown).toContain('# 仓库 Wiki')
+    const architecturePage = await readFile(join(workspaceRoot, 'wiki', 'pages', 'architecture.md'), 'utf-8')
+    expect(architecturePage).toContain('```mermaid')
+    const latestSummaryRaw = await readFile(join(workspaceRoot, 'wiki', 'latest-index-summary.json'), 'utf-8')
+    const latestSummary = JSON.parse(latestSummaryRaw) as { generationMode?: string; pages?: Array<{ id: string }> }
+    expect(latestSummary.generationMode).toBe('multi-page')
+    expect((latestSummary.pages ?? []).length).toBe(5)
 
     await writeFile(
       join(repositoryRoot, 'src', 'worker.ts'),
@@ -134,6 +179,8 @@ describe('ai-indexing-service', () => {
         model: 'test-model',
         language: 'zh',
         analysisDepth: 'standard',
+        subagentCount: 4,
+        scanMode: 'smart',
       },
     })
 

@@ -199,11 +199,63 @@ interface MessageResponseProps {
   /** Markdown 内容 */
   children: string
   className?: string
+  /** 标题锚点前缀（用于多页目录跳转） */
+  headingIdPrefix?: string
 }
 
 /** 使用 react-markdown 渲染 assistant 消息内容，代码块使用 Shiki 语法高亮 */
 export const MessageResponse = React.memo(
-  function MessageResponse({ children, className }: MessageResponseProps): React.ReactElement {
+  function MessageResponse({ children, className, headingIdPrefix }: MessageResponseProps): React.ReactElement {
+    const extractText = React.useCallback((node: React.ReactNode): string => {
+      if (typeof node === 'string') return node
+      if (typeof node === 'number') return String(node)
+      if (!node) return ''
+      if (Array.isArray(node)) return node.map(extractText).join('')
+      if (React.isValidElement(node)) {
+        return extractText((node.props as { children?: React.ReactNode }).children)
+      }
+      return ''
+    }, [])
+
+    const headingIdMap = React.useMemo(() => new Map<string, number>(), [children, headingIdPrefix])
+    const buildHeadingId = React.useCallback((rawText: string): string => {
+      const base = rawText
+        .trim()
+        .toLowerCase()
+        .replace(/[!"#$%&'()*+,./:;<=>?@[\\\]^`{|}~]/g, '')
+        .replace(/\s+/g, '-')
+        .replace(/-+/g, '-')
+      const normalizedBase = base || 'section'
+      const used = headingIdMap.get(normalizedBase) ?? 0
+      headingIdMap.set(normalizedBase, used + 1)
+      const suffix = used > 0 ? `-${used}` : ''
+      const withDup = `${normalizedBase}${suffix}`
+      return headingIdPrefix ? `${headingIdPrefix}-${withDup}` : withDup
+    }, [headingIdMap, headingIdPrefix])
+
+    const renderHeading = React.useCallback((
+      level: 1 | 2 | 3 | 4 | 5 | 6,
+      props: React.HTMLAttributes<HTMLHeadingElement> & { children?: React.ReactNode },
+    ): React.ReactElement => {
+      const text = extractText(props.children)
+      const anchorId = buildHeadingId(text)
+      const headingClass = 'scroll-mt-20'
+      switch (level) {
+        case 1:
+          return <h1 {...props} id={anchorId} data-heading-id={anchorId} className={cn(headingClass, props.className)} />
+        case 2:
+          return <h2 {...props} id={anchorId} data-heading-id={anchorId} className={cn(headingClass, props.className)} />
+        case 3:
+          return <h3 {...props} id={anchorId} data-heading-id={anchorId} className={cn(headingClass, props.className)} />
+        case 4:
+          return <h4 {...props} id={anchorId} data-heading-id={anchorId} className={cn(headingClass, props.className)} />
+        case 5:
+          return <h5 {...props} id={anchorId} data-heading-id={anchorId} className={cn(headingClass, props.className)} />
+        default:
+          return <h6 {...props} id={anchorId} data-heading-id={anchorId} className={cn(headingClass, props.className)} />
+      }
+    }, [buildHeadingId, extractText])
+
     return (
       <div
         className={cn(
@@ -217,6 +269,12 @@ export const MessageResponse = React.memo(
         <Markdown
           remarkPlugins={[remarkGfm]}
           components={{
+            h1: (props) => renderHeading(1, props),
+            h2: (props) => renderHeading(2, props),
+            h3: (props) => renderHeading(3, props),
+            h4: (props) => renderHeading(4, props),
+            h5: (props) => renderHeading(5, props),
+            h6: (props) => renderHeading(6, props),
             a: ({ href, children: linkChildren, ...linkProps }) => (
               <a
                 {...linkProps}
@@ -242,17 +300,6 @@ export const MessageResponse = React.memo(
               if (codeChild) {
                 const codeProps = codeChild.props as { className?: string; children?: React.ReactNode }
                 if (codeProps.className?.includes('language-mermaid')) {
-                  // 递归提取纯文本（children 可能是字符串数组）
-                  const extractText = (node: React.ReactNode): string => {
-                    if (typeof node === 'string') return node
-                    if (typeof node === 'number') return String(node)
-                    if (!node) return ''
-                    if (Array.isArray(node)) return node.map(extractText).join('')
-                    if (React.isValidElement(node)) {
-                      return extractText((node.props as { children?: React.ReactNode }).children)
-                    }
-                    return ''
-                  }
                   const mermaidCode = extractText(codeProps.children).replace(/\n$/, '')
                   return <MermaidBlock code={mermaidCode} />
                 }
@@ -267,7 +314,11 @@ export const MessageResponse = React.memo(
       </div>
     )
   },
-  (prevProps, nextProps) => prevProps.children === nextProps.children
+  (prevProps, nextProps) => (
+    prevProps.children === nextProps.children
+    && prevProps.className === nextProps.className
+    && prevProps.headingIdPrefix === nextProps.headingIdPrefix
+  )
 )
 
 // ===== UserMessageContent 可折叠用户消息 =====

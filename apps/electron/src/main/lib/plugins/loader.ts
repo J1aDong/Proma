@@ -5,6 +5,7 @@
  */
 
 import { resolve } from 'node:path'
+import { statSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 import type { PluginManifest, PluginModule } from '@proma/shared'
 
@@ -18,8 +19,11 @@ export async function loadPluginModule(
   manifest: PluginManifest,
 ): Promise<PluginModule> {
   const entryPath = resolve(installPath, manifest.entry.main)
-  const moduleUrl = pathToFileURL(entryPath).href
-  const module = await import(moduleUrl)
+  const moduleUrl = pathToFileURL(entryPath)
+  // 为 force-sync/热替换场景附加 mtime，避免 Node ESM 缓存导致继续加载旧插件代码。
+  const cacheBust = Math.trunc(statSync(entryPath).mtimeMs)
+  moduleUrl.searchParams.set('mtime', String(cacheBust))
+  const module = await import(moduleUrl.href)
 
   const pluginModule = module as PluginModule
   if (!pluginModule || (typeof pluginModule !== 'object' && typeof pluginModule !== 'function')) {

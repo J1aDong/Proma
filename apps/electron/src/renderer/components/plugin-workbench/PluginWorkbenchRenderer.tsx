@@ -3,6 +3,12 @@ import { MessageResponse } from '@/components/ai-elements/message'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { ModelSelector } from '@/components/chat/ModelSelector'
 import {
   Select,
@@ -51,6 +57,19 @@ interface ChatUiState {
 }
 
 type ChatUiStateMap = Record<string, ChatUiState>
+
+interface MarkdownHeadingItem {
+  id: string
+  text: string
+  level: number
+  pageId: string
+  pageTitle: string
+}
+
+interface MarkdownScrollTarget {
+  pageId: string
+  headingId: string
+}
 
 function buildTaskToolbarCollapseKey(
   pluginId: string,
@@ -145,7 +164,9 @@ function buildActionPayload(
   }
 
   for (const input of action.inputs) {
-    const raw = values[input.key]
+    const raw = Object.prototype.hasOwnProperty.call(values, input.key)
+      ? values[input.key]
+      : getDefaultInputValue(action, input)
 
     if (input.type === 'boolean') {
       payload[input.key] = toBooleanValue(raw)
@@ -226,6 +247,23 @@ function collectDocumentChatNodes(
   }
 }
 
+function findWorkbenchNodeById(node: PluginWorkbenchNode, targetId: string): PluginWorkbenchNode | null {
+  if (node.id === targetId) {
+    return node
+  }
+
+  if ('children' in node && Array.isArray(node.children)) {
+    for (const child of node.children) {
+      const matched = findWorkbenchNodeById(child, targetId)
+      if (matched) {
+        return matched
+      }
+    }
+  }
+
+  return null
+}
+
 function createInitialChatState(node: PluginWorkbenchDocumentChatNode): ChatUiState {
   return {
     knowledgeBaseId: node.knowledgeBaseId,
@@ -240,6 +278,59 @@ function createInitialChatState(node: PluginWorkbenchDocumentChatNode): ChatUiSt
 
 function buildTaskControlKey(pluginId: string, taskId: string, action: PluginTaskControlAction): string {
   return `${pluginId}:${taskId}:${action}`
+}
+
+function toHeadingSlug(rawText: string, slugMap: Map<string, number>, prefix?: string): string {
+  const base = rawText
+    .trim()
+    .toLowerCase()
+    .replace(/[!"#$%&'()*+,./:;<=>?@[\\\]^`{|}~]/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+  const normalizedBase = base || 'section'
+  const used = slugMap.get(normalizedBase) ?? 0
+  slugMap.set(normalizedBase, used + 1)
+  const suffix = used > 0 ? `-${used}` : ''
+  const withDup = `${normalizedBase}${suffix}`
+  return prefix ? `${prefix}-${withDup}` : withDup
+}
+
+function buildHeadingPrefix(pageId: string): string {
+  return pageId.trim().replace(/[^a-zA-Z0-9_-]+/g, '-').replace(/-+/g, '-').toLowerCase() || 'page'
+}
+
+function parseMarkdownHeadings(
+  content: string,
+  pageId: string,
+  pageTitle: string,
+  headingPrefix: string,
+): MarkdownHeadingItem[] {
+  const lines = content.replace(/\r\n/g, '\n').split('\n')
+  const slugMap = new Map<string, number>()
+  const headings: MarkdownHeadingItem[] = []
+
+  for (const line of lines) {
+    const matched = /^(#{2,4})\s+(.+)$/.exec(line.trim())
+    if (!matched) {
+      continue
+    }
+
+    const level = matched[1]?.length ?? 0
+    const text = (matched[2] ?? '').trim()
+    if (!text) {
+      continue
+    }
+
+    headings.push({
+      id: toHeadingSlug(text, slugMap, headingPrefix),
+      text,
+      level,
+      pageId,
+      pageTitle,
+    })
+  }
+
+  return headings
 }
 
 function humanizeTaskState(state: PluginTaskSnapshot['state']): string {
@@ -322,19 +413,57 @@ export function PluginWorkbenchRenderer({
   actionPendingMap,
   onInvokeAction,
 }: PluginWorkbenchRendererProps): React.ReactElement {
+  const isWikiWorkbench = pluginId === 'wiki-local-repository-plugin'
   const [toolbarInputValuesMap, setToolbarInputValuesMap] = React.useState<ToolbarInputsByNode>({})
   const [pathImportPendingMap, setPathImportPendingMap] = React.useState<Record<string, boolean>>({})
   const [taskSnapshotMap, setTaskSnapshotMap] = React.useState<TaskSnapshotMap>({})
   const [taskControlPendingMap, setTaskControlPendingMap] = React.useState<Record<string, boolean>>({})
   const [taskToolbarOpenMap, setTaskToolbarOpenMap] = React.useState<Map<string, boolean>>(new Map())
   const [chatStateMap, setChatStateMap] = React.useState<ChatUiStateMap>({})
+  const [wikiControlPanelOpen, setWikiControlPanelOpen] = React.useState<boolean>(true)
+  const [markdownActivePageMap, setMarkdownActivePageMap] = React.useState<Record<string, string>>({})
+  const [markdownActiveHeadingMap, setMarkdownActiveHeadingMap] = React.useState<Record<string, string>>({})
+  const [markdownScrollTargetMap, setMarkdownScrollTargetMap] = React.useState<Record<string, MarkdownScrollTarget>>({})
+  const [markdownTocDialogOpenMap, setMarkdownTocDialogOpenMap] = React.useState<Record<string, boolean>>({})
+  const markdownContainerRefMap = React.useRef<Record<string, HTMLDivElement | null>>({})
 
   React.useEffect(() => {
     setTaskSnapshotMap({})
     setTaskControlPendingMap({})
     setTaskToolbarOpenMap(new Map())
     setChatStateMap({})
+    setWikiControlPanelOpen(true)
+    setMarkdownActivePageMap({})
+    setMarkdownActiveHeadingMap({})
+    setMarkdownScrollTargetMap({})
+    setMarkdownTocDialogOpenMap({})
+    markdownContainerRefMap.current = {}
   }, [pluginId])
+
+  const wikiHasMarkdownContent = React.useMemo(() => {
+    if (!isWikiWorkbench) {
+      return false
+    }
+
+    const markdownNode = findWorkbenchNodeById(canvas.root, 'wiki-markdown')
+    if (!markdownNode || markdownNode.type !== 'markdown') {
+      return false
+    }
+
+    if ((markdownNode.content?.trim().length ?? 0) > 0) {
+      return true
+    }
+
+    return (markdownNode.pages ?? []).some((page) => (page.content?.trim().length ?? 0) > 0)
+  }, [canvas.root, isWikiWorkbench])
+
+  React.useEffect(() => {
+    if (!isWikiWorkbench) {
+      return
+    }
+
+    setWikiControlPanelOpen(!wikiHasMarkdownContent)
+  }, [isWikiWorkbench, wikiHasMarkdownContent])
 
   React.useEffect(() => {
     const taskNodes: Array<{ nodeKey: string; node: PluginWorkbenchTaskStatusNode }> = []
@@ -472,6 +601,48 @@ export function PluginWorkbenchRenderer({
       disposeChat()
     }
   }, [pluginId])
+
+  React.useEffect(() => {
+    const entries = Object.entries(markdownScrollTargetMap)
+    if (entries.length === 0) {
+      return
+    }
+
+    const rafId = window.requestAnimationFrame(() => {
+      setMarkdownScrollTargetMap((prev) => {
+        const next = { ...prev }
+
+        for (const [nodeKey, target] of entries) {
+          const currentPageId = markdownActivePageMap[nodeKey]
+          if (currentPageId && currentPageId !== target.pageId) {
+            continue
+          }
+          const container = markdownContainerRefMap.current[nodeKey]
+          if (!container) {
+            continue
+          }
+
+          const heading = container.querySelector(`[data-heading-id="${target.headingId}"]`) as HTMLElement | null
+          if (!heading) {
+            continue
+          }
+
+          const top = Math.max(0, heading.offsetTop - 12)
+          container.scrollTo({
+            top,
+            behavior: 'smooth',
+          })
+          delete next[nodeKey]
+        }
+
+        return next
+      })
+    })
+
+    return () => {
+      window.cancelAnimationFrame(rafId)
+    }
+  }, [markdownScrollTargetMap, markdownActivePageMap, canvas])
 
   const updateToolbarInput = React.useCallback((nodeKey: string, inputKey: string, value: unknown): void => {
     setToolbarInputValuesMap((prev) => {
@@ -650,7 +821,7 @@ export function PluginWorkbenchRenderer({
 
     if (input.type === 'boolean') {
       return (
-        <div key={inputId} className="min-w-[160px] rounded-md border border-border/60 bg-background/80 px-3 py-2 space-y-2">
+        <div key={inputId} className="w-full rounded-md border border-border/60 bg-background/80 px-3 py-2 space-y-2">
           {commonHeader}
           <div className="flex items-center justify-between gap-2">
             <span className="text-xs text-muted-foreground">{toBooleanValue(currentValue) ? '已启用' : '未启用'}</span>
@@ -669,7 +840,7 @@ export function PluginWorkbenchRenderer({
       const selectValue = toTextValue(currentValue) || fallbackValue
 
       return (
-        <div key={inputId} className="min-w-[220px] space-y-1.5">
+        <div key={inputId} className="w-full space-y-1.5">
           {commonHeader}
           <Select
             value={selectValue}
@@ -692,14 +863,21 @@ export function PluginWorkbenchRenderer({
 
     if (input.type === 'model-select') {
       const selectValue = toTextValue(currentValue) || '__auto__'
+      const normalizedSelectValue = selectValue.includes(':')
+        ? selectValue.split(':').slice(1).join(':')
+        : selectValue
 
       return (
-        <div key={inputId} className="min-w-[220px] space-y-1.5 flex flex-col items-start">
+        <div key={inputId} className="w-full space-y-1.5 flex flex-col items-start">
           {commonHeader}
           <div className="h-9 w-full flex items-center rounded-md border border-input bg-transparent px-3 py-1 text-base shadow-sm">
             <ModelSelector
-              externalSelectedModelId={selectValue}
-              onModelSelect={(option) => updateToolbarInput(nodeKey, input.key, option.modelId)}
+              externalSelectedModelId={normalizedSelectValue}
+              onModelSelect={(option) => updateToolbarInput(
+                nodeKey,
+                input.key,
+                option.modelId === '__auto__' ? '__auto__' : `${option.channelId}:${option.modelId}`,
+              )}
               includeAutoOption={true}
               triggerClassName="h-full w-full justify-between text-sm px-0 rounded-none border-none hover:bg-transparent"
             />
@@ -713,11 +891,12 @@ export function PluginWorkbenchRenderer({
       const isImportPending = pathImportPendingMap[pendingKey] === true
 
       return (
-        <div key={inputId} className="min-w-[460px] space-y-1.5">
+        <div key={inputId} className="w-full space-y-1.5 lg:col-span-2">
           {commonHeader}
-          <div className="flex items-center gap-2">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
             <Input
               id={inputId}
+              className="sm:flex-1"
               type="text"
               placeholder={input.placeholder}
               value={toTextValue(currentValue)}
@@ -740,7 +919,7 @@ export function PluginWorkbenchRenderer({
     }
 
     return (
-      <div key={inputId} className="min-w-[360px] space-y-1.5">
+      <div key={inputId} className="w-full space-y-1.5">
         {commonHeader}
         <Input
           id={inputId}
@@ -761,6 +940,110 @@ export function PluginWorkbenchRenderer({
 
     switch (node.type) {
       case 'page': {
+        if (isWikiWorkbench && node.id === 'wiki-root') {
+          // 兼容旧画布结构（wiki-main-split/wiki-sidebar/wiki-main）与新结构（controls/main panel）。
+          const controlPanelNode = findWorkbenchNodeById(node, 'wiki-controls-panel')
+            ?? findWorkbenchNodeById(node, 'wiki-sidebar')
+          const mainPanelNode = findWorkbenchNodeById(node, 'wiki-main-panel')
+            ?? findWorkbenchNodeById(node, 'wiki-main')
+          const taskStatusNode = findWorkbenchNodeById(node, 'wiki-task-status')
+          const activeTask = taskStatusNode && taskStatusNode.type === 'task-status'
+            ? resolveTaskForNode(taskStatusNode)
+            : null
+          const taskProgressPercent = activeTask?.progress?.percent ?? 0
+          const taskStage = activeTask?.progress?.stage ?? 'pending'
+          const taskInFlight = activeTask?.state === 'running' || activeTask?.state === 'paused'
+          const fallbackTaskControls: PluginTaskControlAction[] = ['pause', 'resume', 'stop']
+          const taskControlActions: PluginTaskControlAction[] = taskStatusNode && taskStatusNode.type === 'task-status'
+            ? (taskStatusNode.controlActions ?? fallbackTaskControls)
+            : fallbackTaskControls
+
+          return (
+            <div key={nodeKey} className="flex h-full min-h-0 min-w-0 flex-col gap-4 overflow-hidden p-4">
+              {(node.title || node.description) && (
+                <header className="flex shrink-0 items-start justify-between gap-3">
+                  <div className="space-y-1">
+                    {node.title && <h3 className="text-base font-semibold text-foreground">{node.title}</h3>}
+                    {node.description && <p className="text-sm text-muted-foreground">{node.description}</p>}
+                  </div>
+                  <div className="flex flex-wrap items-center justify-end gap-2">
+                    {wikiHasMarkdownContent && !wikiControlPanelOpen && taskInFlight && activeTask ? (
+                      <div className="flex items-center gap-2 rounded-full bg-background/95 px-3 py-1.5 shadow-sm ring-1 ring-border/60">
+                        <span className="text-[11px] text-muted-foreground">
+                          {taskStage} · {Math.round(taskProgressPercent)}%
+                        </span>
+                        <div className="flex items-center gap-1">
+                          {taskControlActions.map((action) => {
+                            const pendingKey = buildTaskControlKey(pluginId, activeTask.taskId, action)
+                            const pending = taskControlPendingMap[pendingKey] === true
+                            const disableByState =
+                              action === 'pause'
+                                ? activeTask.state !== 'running'
+                                : action === 'resume'
+                                  ? activeTask.state !== 'paused'
+                                  : activeTask.state !== 'running' && activeTask.state !== 'paused'
+                            return (
+                              <Button
+                                key={`${nodeKey}-header-${action}`}
+                                size="sm"
+                                variant={action === 'stop' ? 'destructive' : 'outline'}
+                                className="h-7 rounded-full px-2 text-[11px]"
+                                disabled={pending || disableByState}
+                                onClick={() => {
+                                  void controlPluginTask(action, activeTask.taskId)
+                                }}
+                              >
+                                {pending ? '处理中' : action}
+                              </Button>
+                            )
+                          })}
+                        </div>
+                      </div>
+                    ) : null}
+
+                    {wikiHasMarkdownContent ? (
+                      <Button
+                        size="sm"
+                        variant={wikiControlPanelOpen ? 'secondary' : 'outline'}
+                        className="shrink-0 rounded-full px-3 text-xs"
+                        onClick={() => {
+                          setWikiControlPanelOpen((prev) => !prev)
+                        }}
+                      >
+                        {wikiControlPanelOpen ? '收起控制与会话' : '展开控制与会话'}
+                      </Button>
+                    ) : null}
+                  </div>
+                </header>
+              )}
+
+              {!wikiHasMarkdownContent ? (
+                <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
+                  {controlPanelNode
+                    ? renderNode(controlPanelNode, `${nodeKey}-controls`)
+                    : <p className="text-sm text-muted-foreground">暂无控制面板配置</p>}
+                </div>
+              ) : (
+                <div className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden">
+                  <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
+                    {mainPanelNode
+                      ? renderNode(mainPanelNode, `${nodeKey}-main`)
+                      : <p className="text-sm text-muted-foreground">暂无 Wiki 内容节点</p>}
+                  </div>
+
+                  {wikiControlPanelOpen && controlPanelNode ? (
+                    <div className="pointer-events-none absolute left-1/2 top-2 z-20 flex w-full -translate-x-1/2 justify-center px-4">
+                      <div className="pointer-events-auto max-h-[calc(100%-0.5rem)] w-full max-w-5xl overflow-y-auto rounded-2xl border border-border/40 bg-background/95 p-4 shadow-[0_18px_45px_-28px_rgba(0,0,0,0.55)] backdrop-blur">
+                        {renderNode(controlPanelNode, `${nodeKey}-controls-floating`)}
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+              )}
+            </div>
+          )
+        }
+
         return (
           <div key={nodeKey} className="flex h-full min-h-0 min-w-0 flex-col gap-4 overflow-hidden p-4">
             {(node.title || node.description) && (
@@ -777,10 +1060,20 @@ export function PluginWorkbenchRenderer({
       }
 
       case 'panel': {
+        const isWikiControlPanel = isWikiWorkbench && node.id === 'wiki-controls-panel'
+        const isWikiMainPanel = isWikiWorkbench && node.id === 'wiki-main-panel'
+
         return (
           <section
             key={nodeKey}
-            className="rounded-xl border border-border/60 bg-background/70 p-4 shadow-sm flex min-h-0 min-w-0 flex-col gap-3 h-full overflow-hidden"
+            className={cn(
+              'flex h-full min-h-0 min-w-0 flex-col gap-3 overflow-hidden',
+              isWikiControlPanel
+                ? 'rounded-none border-none bg-transparent p-0 shadow-none'
+                : isWikiMainPanel
+                  ? 'rounded-2xl border border-border/40 bg-background/80 p-3 shadow-sm'
+                  : 'rounded-xl border border-border/60 bg-background/70 p-4 shadow-sm',
+            )}
           >
             {(node.title || node.description) && (
               <header className="space-y-1 shrink-0">
@@ -788,7 +1081,10 @@ export function PluginWorkbenchRenderer({
                 {node.description && <p className="text-xs text-muted-foreground">{node.description}</p>}
               </header>
             )}
-            <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-3 overflow-y-auto pr-1">
+            <div className={cn(
+              'flex min-h-0 min-w-0 flex-1 flex-col gap-3 overflow-y-auto',
+              isWikiControlPanel ? 'pr-0' : 'pr-1',
+            )}>
               {node.children.map((child, index) => renderNode(child, `${nodeKey}-${index}`))}
             </div>
           </section>
@@ -842,10 +1138,17 @@ export function PluginWorkbenchRenderer({
       }
 
       case 'toolbar': {
+        const isWikiToolbar = isWikiWorkbench && node.id === 'wiki-toolbar'
+
         return (
           <div
             key={nodeKey}
-            className="rounded-xl border border-border/60 bg-muted/20 px-3 py-2 space-y-3"
+            className={cn(
+              'space-y-3',
+              isWikiToolbar
+                ? 'rounded-none bg-transparent px-0 py-0'
+                : 'rounded-xl border border-border/60 bg-muted/20 px-3 py-2',
+            )}
           >
             {node.title && (
               <div className="text-xs font-medium text-muted-foreground">
@@ -864,9 +1167,14 @@ export function PluginWorkbenchRenderer({
                 return (
                   <div
                     key={`${nodeKey}-${action.id}`}
-                    className="rounded-lg border border-border/60 bg-background/80 p-3 space-y-3"
+                    className={cn(
+                      'space-y-3 rounded-lg',
+                      isWikiToolbar
+                        ? 'bg-transparent px-0 py-1'
+                        : 'border border-border/60 bg-background/80 p-4',
+                    )}
                   >
-                    <div className="flex items-center justify-between gap-3">
+                    <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                       <div className="space-y-0.5">
                         <p className="text-sm font-medium text-foreground">{action.label}</p>
                         {action.description && (
@@ -876,6 +1184,7 @@ export function PluginWorkbenchRenderer({
                       <Button
                         size="sm"
                         variant={variant}
+                        className="w-full sm:w-auto"
                         disabled={action.disabled || isPending || invalid}
                         onClick={() => {
                           onInvokeAction({
@@ -890,7 +1199,7 @@ export function PluginWorkbenchRenderer({
                     </div>
 
                     {action.inputs && action.inputs.length > 0 && (
-                      <div className="flex flex-wrap items-start gap-3">
+                      <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
                         {action.inputs.map((input) => renderToolbarInput(nodeKey, action, input))}
                       </div>
                     )}
@@ -903,29 +1212,259 @@ export function PluginWorkbenchRenderer({
       }
 
       case 'markdown': {
+        const isWikiMarkdown = isWikiWorkbench && node.id === 'wiki-markdown'
         const content = node.content?.trim() ?? ''
+        const pages = (node.pages ?? []).map((page) => ({
+          id: page.id,
+          title: page.title,
+          sourcePath: page.sourcePath,
+          content: page.content?.trim() ?? '',
+          headingPrefix: buildHeadingPrefix(page.id),
+        }))
+        const hasPages = pages.length > 0
+        const fallbackPageId = pages[0]?.id ?? ''
+        const activePageId = hasPages
+          ? (markdownActivePageMap[nodeKey] ?? node.activePageId ?? fallbackPageId)
+          : ''
+        const activePage = hasPages
+          ? pages.find((page) => page.id === activePageId) ?? pages[0]
+          : undefined
+        const activeContent = activePage ? activePage.content : content
+        const activeHeadingPrefix = activePage?.headingPrefix
+        const displaySourcePath = activePage?.sourcePath ?? node.sourcePath
+        const pageHeadingGroups = pages.map((page) => ({
+          page,
+          headings: parseMarkdownHeadings(page.content, page.id, page.title, page.headingPrefix),
+        }))
+        const activePageHeadings = pageHeadingGroups.find((group) => group.page.id === activePage?.id)?.headings ?? []
+        const activeHeadingId = markdownActiveHeadingMap[nodeKey]
+
+        const updateActiveHeadingByScroll = (): void => {
+          if (!hasPages || !activePage || activePageHeadings.length === 0) {
+            return
+          }
+
+          const container = markdownContainerRefMap.current[nodeKey]
+          if (!container) {
+            return
+          }
+
+          const scrollTop = container.scrollTop
+          let currentId = activePageHeadings[0]?.id
+
+          for (const heading of activePageHeadings) {
+            const element = container.querySelector(`[data-heading-id="${heading.id}"]`) as HTMLElement | null
+            if (!element) {
+              continue
+            }
+            if (element.offsetTop - 18 <= scrollTop) {
+              currentId = heading.id
+              continue
+            }
+            break
+          }
+
+          if (!currentId) {
+            return
+          }
+
+          setMarkdownActiveHeadingMap((prev) => {
+            if (prev[nodeKey] === currentId) {
+              return prev
+            }
+            return {
+              ...prev,
+              [nodeKey]: currentId,
+            }
+          })
+        }
+
+        const openTocDialog = markdownTocDialogOpenMap[nodeKey] === true
+        const renderWikiToc = (compact = false): React.ReactElement => (
+          <div className={cn('space-y-2', compact ? 'mt-0' : 'mt-2')}>
+            {pageHeadingGroups.map((group) => {
+              const pageSelected = group.page.id === activePage?.id
+              return (
+                <div key={`${nodeKey}-toc-${group.page.id}`} className="space-y-1">
+                  <button
+                    type="button"
+                    className={cn(
+                      'w-full rounded-md px-2 py-1 text-left text-xs transition-colors',
+                      pageSelected
+                        ? 'bg-primary/10 text-primary'
+                        : 'text-muted-foreground hover:bg-muted/50 hover:text-foreground',
+                    )}
+                    onClick={() => {
+                      setMarkdownActivePageMap((prev) => ({
+                        ...prev,
+                        [nodeKey]: group.page.id,
+                      }))
+                      const firstHeadingId = group.headings[0]?.id
+                      if (firstHeadingId) {
+                        setMarkdownActiveHeadingMap((prev) => ({
+                          ...prev,
+                          [nodeKey]: firstHeadingId,
+                        }))
+                      }
+                      if (compact) {
+                        setMarkdownTocDialogOpenMap((prev) => ({
+                          ...prev,
+                          [nodeKey]: false,
+                        }))
+                      }
+                    }}
+                  >
+                    {group.page.title}
+                  </button>
+                  {group.headings.length > 0 ? (
+                    <div className="space-y-0.5 pl-1">
+                      {group.headings.map((heading) => {
+                        const selected = pageSelected && activeHeadingId === heading.id
+                        return (
+                          <button
+                            key={`${nodeKey}-toc-${group.page.id}-${heading.id}`}
+                            type="button"
+                            className={cn(
+                              'block w-full rounded px-2 py-1 text-left text-[11px] leading-snug transition-colors',
+                              heading.level >= 3 ? 'pl-4' : 'pl-2',
+                              selected
+                                ? 'bg-primary/15 text-primary'
+                                : 'text-muted-foreground hover:bg-muted/40 hover:text-foreground',
+                            )}
+                            onClick={() => {
+                              if (group.page.id !== activePage?.id) {
+                                setMarkdownActivePageMap((prev) => ({
+                                  ...prev,
+                                  [nodeKey]: group.page.id,
+                                }))
+                              }
+                              setMarkdownScrollTargetMap((prev) => ({
+                                ...prev,
+                                [nodeKey]: {
+                                  pageId: group.page.id,
+                                  headingId: heading.id,
+                                },
+                              }))
+                              if (compact) {
+                                setMarkdownTocDialogOpenMap((prev) => ({
+                                  ...prev,
+                                  [nodeKey]: false,
+                                }))
+                              }
+                            }}
+                          >
+                            {heading.text}
+                          </button>
+                        )
+                      })}
+                    </div>
+                  ) : (
+                    <p className="pl-2 text-[11px] text-muted-foreground/70">该页暂无可定位标题</p>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        )
+
         return (
-          <div key={nodeKey} className="flex flex-col h-full min-h-0 rounded-xl border border-border/60 bg-background/80 p-4 space-y-2">
+          <div
+            key={nodeKey}
+            className={cn(
+              'flex h-full min-h-0 flex-col space-y-2',
+              isWikiMarkdown
+                ? 'rounded-xl bg-background/90 p-4'
+                : 'rounded-xl border border-border/60 bg-background/80 p-4',
+            )}
+          >
             {(node.title || node.description) && (
-              <header className="space-y-1 shrink-0">
-                {node.title && <h5 className="text-sm font-semibold text-foreground">{node.title}</h5>}
+              <header className="shrink-0 space-y-1">
+                <div className="flex items-start justify-between gap-2">
+                  {node.title && <h5 className="text-sm font-semibold text-foreground">{node.title}</h5>}
+                  {isWikiMarkdown && hasPages ? (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      className="h-7 px-2 text-xs md:hidden"
+                      onClick={() => {
+                        setMarkdownTocDialogOpenMap((prev) => ({
+                          ...prev,
+                          [nodeKey]: true,
+                        }))
+                      }}
+                    >
+                      目录地图
+                    </Button>
+                  ) : null}
+                </div>
                 {node.description && <p className="text-xs text-muted-foreground">{node.description}</p>}
               </header>
             )}
 
-            {node.sourcePath && (
-              <p className="text-[11px] font-mono text-muted-foreground shrink-0">来源：{node.sourcePath}</p>
+            {displaySourcePath && (
+              <p className="text-[11px] font-mono text-muted-foreground shrink-0">来源：{displaySourcePath}</p>
             )}
 
-            <div className="flex-1 min-h-0 overflow-y-auto pr-2">
-              {content.length > 0 ? (
-                <MessageResponse>{content}</MessageResponse>
-              ) : (
-                <p className="text-sm text-muted-foreground mt-4">
-                  {node.emptyText ?? '暂无可展示的 Markdown 内容'}
-                </p>
-              )}
+            <div className="relative flex-1 min-h-0 overflow-hidden">
+              <div
+                ref={(element) => {
+                  markdownContainerRefMap.current[nodeKey] = element
+                  if (element && hasPages) {
+                    window.requestAnimationFrame(() => {
+                      updateActiveHeadingByScroll()
+                    })
+                  }
+                }}
+                className={cn(
+                  'h-full overflow-y-auto pr-2',
+                  isWikiMarkdown && hasPages ? 'md:pr-[20rem]' : 'pr-2',
+                )}
+                onScroll={() => {
+                  updateActiveHeadingByScroll()
+                }}
+              >
+                {activeContent.length > 0 ? (
+                  <MessageResponse headingIdPrefix={activeHeadingPrefix}>{activeContent}</MessageResponse>
+                ) : (
+                  <p className="text-sm text-muted-foreground mt-4">
+                    {node.emptyText ?? '暂无可展示的 Markdown 内容'}
+                  </p>
+                )}
+              </div>
+
+              {isWikiMarkdown && hasPages ? (
+                <aside className="pointer-events-none absolute right-2 top-2 z-20 hidden w-72 md:block">
+                  <div className="pointer-events-auto max-h-[calc(100%-0.5rem)] overflow-y-auto rounded-xl border border-border/50 bg-background/95 p-3 shadow-sm backdrop-blur-sm">
+                    <p className="text-xs font-semibold text-foreground">目录地图</p>
+                    <p className="mt-0.5 text-[11px] text-muted-foreground">全局目录（按页面分组）</p>
+                    {renderWikiToc()}
+                  </div>
+                </aside>
+              ) : null}
             </div>
+
+            {isWikiMarkdown && hasPages ? (
+              <Dialog
+                open={openTocDialog}
+                onOpenChange={(open) => {
+                  setMarkdownTocDialogOpenMap((prev) => ({
+                    ...prev,
+                    [nodeKey]: open,
+                  }))
+                }}
+              >
+                <DialogContent className="max-h-[80vh] overflow-hidden p-0 sm:max-w-md md:hidden">
+                  <DialogHeader className="border-b border-border/60 px-4 py-3">
+                    <DialogTitle className="text-sm">目录地图</DialogTitle>
+                  </DialogHeader>
+                  <div className="max-h-[calc(80vh-52px)] overflow-y-auto px-4 py-3">
+                    <p className="text-[11px] text-muted-foreground">全局目录（按页面分组）</p>
+                    {renderWikiToc(true)}
+                  </div>
+                </DialogContent>
+              </Dialog>
+            ) : null}
           </div>
         )
       }
@@ -933,6 +1472,7 @@ export function PluginWorkbenchRenderer({
       case 'task-status': {
         const taskNode = node as PluginWorkbenchTaskStatusNode
         const task = resolveTaskForNode(taskNode)
+        const isWikiTaskStatus = isWikiWorkbench && node.id === 'wiki-task-status'
 
         if (!task) {
           return (
@@ -957,7 +1497,12 @@ export function PluginWorkbenchRenderer({
             onOpenChange={(open) => {
               setTaskToolbarOpen(collapseKey, open)
             }}
-            className="rounded-xl border border-border/70 bg-background/80 p-4 space-y-3"
+            className={cn(
+              'space-y-3 rounded-xl p-4',
+              isWikiTaskStatus
+                ? 'border-none bg-transparent p-0'
+                : 'border border-border/70 bg-background/80',
+            )}
           >
             <div className="flex items-start justify-between gap-3">
               <div className="space-y-1">
@@ -1030,9 +1575,18 @@ export function PluginWorkbenchRenderer({
       case 'document-chat': {
         const chatNode = node as PluginWorkbenchDocumentChatNode
         const state = chatStateMap[nodeKey] ?? createInitialChatState(chatNode)
+        const isWikiDocumentChat = isWikiWorkbench && node.id === 'wiki-doc-chat'
 
         return (
-          <div key={nodeKey} className="rounded-xl border border-border/60 bg-background/80 p-4 flex flex-col h-full min-h-0 space-y-3">
+          <div
+            key={nodeKey}
+            className={cn(
+              'flex h-full min-h-0 flex-col space-y-3 rounded-xl p-4',
+              isWikiDocumentChat
+                ? 'border-none bg-transparent p-0'
+                : 'border border-border/60 bg-background/80',
+            )}
+          >
             {(chatNode.title || chatNode.description) && (
               <header className="space-y-1 shrink-0">
                 {chatNode.title && <h5 className="text-sm font-semibold text-foreground">{chatNode.title}</h5>}
@@ -1040,7 +1594,12 @@ export function PluginWorkbenchRenderer({
               </header>
             )}
 
-            <div className="rounded-lg border border-border/50 bg-muted/10 p-3 flex-1 min-h-0 overflow-y-auto space-y-3 relative">
+            <div className={cn(
+              'relative flex-1 min-h-0 overflow-y-auto space-y-3 rounded-lg p-3',
+              isWikiDocumentChat
+                ? 'bg-background/60'
+                : 'border border-border/50 bg-muted/10',
+            )}>
               {state.messages.length > 0 ? (
                 state.messages.map((message, index) => (
                   <div key={`${nodeKey}-message-${index}`} className={cn(
@@ -1076,7 +1635,12 @@ export function PluginWorkbenchRenderer({
             </div>
 
             {state.references.length > 0 && (
-              <Collapsible className="shrink-0 border border-border/40 rounded-lg overflow-hidden bg-muted/10">
+              <Collapsible className={cn(
+                'shrink-0 overflow-hidden rounded-lg',
+                isWikiDocumentChat
+                  ? 'border border-border/30 bg-background/50'
+                  : 'border border-border/40 bg-muted/10',
+              )}>
                 <CollapsibleTrigger className="flex w-full items-center justify-between px-3 py-2 text-xs font-medium text-muted-foreground hover:bg-muted/30 transition-colors">
                   <div className="flex items-center gap-2">
                     <span className="i-lucide-file-text w-3.5 h-3.5" />

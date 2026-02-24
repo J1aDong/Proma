@@ -12,6 +12,7 @@ const LATEST_JSON_PATH = 'wiki/latest.json'
 const LATEST_MD_PATH = 'wiki/latest.md'
 const LATEST_TASK_PATH = 'wiki/latest-task.json'
 const LATEST_INDEX_SUMMARY_PATH = 'wiki/latest-index-summary.json'
+const WIKI_CONFIG_PATH = 'wiki/config.json'
 
 const WORKBENCH_ERROR_CODE = {
   pluginNotActive: 'PLUGIN_NOT_ACTIVE',
@@ -29,6 +30,18 @@ const WORKBENCH_ACTION_ID = {
 
 const DEFAULT_WIKI_LANGUAGE = 'zh'
 const DEFAULT_ANALYSIS_DEPTH = 'deep'
+const DEFAULT_SCAN_MODE = 'smart'
+const DEFAULT_SUBAGENT_COUNT = 4
+const MAX_SUBAGENT_COUNT = 8
+const DEFAULT_MAX_FILE_BYTES_FOR_FULL_ANALYZE = 700 * 1024
+
+/**
+ * @typedef {{
+ *   defaultSubagentCount: number
+ *   scanMode: 'smart' | 'full'
+ *   maxFileBytesForFullAnalyze: number
+ * }} WikiPluginConfig
+ */
 
 /**
  * @param {string} code
@@ -78,6 +91,52 @@ async function readWorkspaceJsonIfExists(filePath) {
 }
 
 /**
+ * @param {unknown} raw
+ * @returns {Array<{ id: string; title: string; path: string }>}
+ */
+function normalizePageSummaries(raw) {
+  if (!Array.isArray(raw)) {
+    return []
+  }
+
+  return raw
+    .map((item) => {
+      if (!item || typeof item !== 'object') {
+        return null
+      }
+      const page = /** @type {{ id?: unknown; title?: unknown; path?: unknown }} */ (item)
+      const id = typeof page.id === 'string' ? page.id.trim() : ''
+      const title = typeof page.title === 'string' ? page.title.trim() : ''
+      const path = typeof page.path === 'string' ? page.path.trim() : ''
+      if (!id || !title || !path) {
+        return null
+      }
+      return { id, title, path }
+    })
+    .filter((item) => item !== null)
+}
+
+/**
+ * @param {Array<{ id: string; title: string; path: string }>} pages
+ * @returns {Promise<Array<{ id: string; title: string; sourcePath: string; content: string }>>}
+ */
+async function loadMarkdownPages(pages) {
+  const result = []
+
+  for (const page of pages) {
+    const content = await readWorkspaceFileIfExists(page.path)
+    result.push({
+      id: page.id,
+      title: page.title,
+      sourcePath: page.path,
+      content: content ?? '',
+    })
+  }
+
+  return result
+}
+
+/**
  * @param {Record<string, unknown>} payload
  */
 function normalizeModel(payload) {
@@ -113,6 +172,102 @@ function normalizeAnalysisDepth(payload) {
   }
 
   return DEFAULT_ANALYSIS_DEPTH
+}
+
+/**
+ * @param {Record<string, unknown>} payload
+ * @returns {'smart' | 'full'}
+ */
+function normalizeScanMode(payload) {
+  const scanMode = typeof payload.scanMode === 'string' ? payload.scanMode.trim().toLowerCase() : ''
+  if (scanMode === 'full') {
+    return 'full'
+  }
+
+  return DEFAULT_SCAN_MODE
+}
+
+/**
+ * @param {unknown} raw
+ * @returns {number}
+ */
+function clampSubagentCount(raw) {
+  const numeric = typeof raw === 'number' ? raw : Number(raw)
+  if (!Number.isFinite(numeric)) {
+    return DEFAULT_SUBAGENT_COUNT
+  }
+
+  return Math.max(1, Math.min(MAX_SUBAGENT_COUNT, Math.floor(numeric)))
+}
+
+/**
+ * @param {Record<string, unknown>} payload
+ * @returns {number}
+ */
+function normalizeSubagentCount(payload) {
+  return clampSubagentCount(payload.subagentCount)
+}
+
+/**
+ * @param {Record<string, unknown>} payload
+ * @returns {number}
+ */
+function normalizeMaxFileBytes(payload) {
+  const numeric = typeof payload.maxFileBytesForFullAnalyze === 'number'
+    ? payload.maxFileBytesForFullAnalyze
+    : Number(payload.maxFileBytesForFullAnalyze)
+  if (!Number.isFinite(numeric)) {
+    return DEFAULT_MAX_FILE_BYTES_FOR_FULL_ANALYZE
+  }
+
+  return Math.max(128 * 1024, Math.min(8 * 1024 * 1024, Math.floor(numeric)))
+}
+
+/**
+ * @param {unknown} raw
+ * @returns {boolean}
+ */
+function normalizeSaveAsDefault(raw) {
+  if (typeof raw === 'boolean') {
+    return raw
+  }
+  if (typeof raw === 'string') {
+    return raw.trim().toLowerCase() === 'true'
+  }
+  return false
+}
+
+/**
+ * @param {Record<string, unknown> | null} raw
+ * @returns {WikiPluginConfig}
+ */
+function toWikiPluginConfig(raw) {
+  return {
+    defaultSubagentCount: clampSubagentCount(raw?.defaultSubagentCount),
+    scanMode: raw?.scanMode === 'full' ? 'full' : DEFAULT_SCAN_MODE,
+    maxFileBytesForFullAnalyze: normalizeMaxFileBytes({
+      maxFileBytesForFullAnalyze: raw?.maxFileBytesForFullAnalyze,
+    }),
+  }
+}
+
+/**
+ * @returns {Promise<WikiPluginConfig>}
+ */
+async function readPluginConfig() {
+  const raw = await readWorkspaceJsonIfExists(WIKI_CONFIG_PATH)
+  return toWikiPluginConfig(raw)
+}
+
+/**
+ * @param {WikiPluginConfig} config
+ */
+async function writePluginConfig(config) {
+  if (!runtimeContext) {
+    return
+  }
+
+  await runtimeContext.api.fs.writeText(WIKI_CONFIG_PATH, JSON.stringify(config, null, 2))
 }
 
 /**
@@ -242,9 +397,21 @@ async function runCapabilityAction(payload) {
     const model = normalizeModel(normalizedPayload)
     const language = normalizeLanguage(normalizedPayload)
     const analysisDepth = normalizeAnalysisDepth(normalizedPayload)
+    const scanMode = normalizeScanMode(normalizedPayload)
+    const subagentCount = normalizeSubagentCount(normalizedPayload)
+    const maxFileBytesForFullAnalyze = normalizeMaxFileBytes(normalizedPayload)
+    const saveAsDefault = normalizeSaveAsDefault(normalizedPayload.saveAsDefault)
     const knowledgeBaseId = typeof normalizedPayload.knowledgeBaseId === 'string' && normalizedPayload.knowledgeBaseId.trim()
       ? normalizedPayload.knowledgeBaseId.trim()
       : undefined
+
+    if (saveAsDefault) {
+      await writePluginConfig({
+        defaultSubagentCount: subagentCount,
+        scanMode,
+        maxFileBytesForFullAnalyze,
+      })
+    }
 
     const startResult = await runtimeContext.api.aiIndexing.startScan({
       repositoryPath: repoPath,
@@ -252,6 +419,9 @@ async function runCapabilityAction(payload) {
       model,
       language,
       analysisDepth,
+      scanMode,
+      subagentCount,
+      maxFileBytesForFullAnalyze,
     })
 
     if (!startResult.success || !startResult.task) {
@@ -267,6 +437,9 @@ async function runCapabilityAction(payload) {
       model: startResult.task.metadata?.model,
       language: startResult.task.metadata?.language,
       analysisDepth: startResult.task.metadata?.analysisDepth,
+      scanMode: startResult.task.metadata?.scanMode,
+      subagentCount: startResult.task.metadata?.subagentCount,
+      maxFileBytesForFullAnalyze,
       updatedAt: startResult.task.updatedAt,
     })
 
@@ -327,6 +500,7 @@ async function runCapabilityAction(payload) {
       markdown: markdown ?? '',
       latest,
       indexSummary: summary,
+      pages: summary?.pages ?? [],
     }
   }
 
@@ -362,8 +536,22 @@ export async function getWorkbenchCanvas() {
 
   try {
     const latestMarkdown = await readWorkspaceFileIfExists(LATEST_MD_PATH)
+    const latestJson = await readWorkspaceJsonIfExists(LATEST_JSON_PATH)
     const latestTask = await readWorkspaceJsonIfExists(LATEST_TASK_PATH)
     const latestIndexSummary = await readWorkspaceJsonIfExists(LATEST_INDEX_SUMMARY_PATH)
+    const pluginConfig = await readPluginConfig()
+
+    const summaryPages = normalizePageSummaries(latestIndexSummary?.pages ?? latestJson?.pages)
+    const markdownPages = await loadMarkdownPages(summaryPages)
+    const hasMultiPages = markdownPages.length > 0
+    const activePageId = typeof latestJson?.activePageId === 'string' && latestJson.activePageId.trim().length > 0
+      ? latestJson.activePageId.trim()
+      : hasMultiPages
+        ? markdownPages[0]?.id
+        : undefined
+    const effectiveMarkdown = hasMultiPages
+      ? ''
+      : (latestMarkdown ?? '')
 
     const taskId = latestTask && typeof latestTask.taskId === 'string' ? latestTask.taskId : undefined
     const taskStatus = taskId
@@ -388,136 +576,179 @@ export async function getWorkbenchCanvas() {
           description: '扫描仓库构建索引后，可在同一画布继续聊天。',
           children: [
             {
-              id: 'wiki-main-split',
-              type: 'split',
-              direction: 'horizontal',
-              ratios: [1, 2.4],
+              id: 'wiki-controls-panel',
+              type: 'panel',
+              title: '控制与会话',
               children: [
                 {
-                  id: 'wiki-sidebar',
-                  type: 'panel',
-                  title: '控制与会话',
-                  children: [
+                  id: 'wiki-toolbar',
+                  type: 'toolbar',
+                  title: '操作',
+                  actions: [
                     {
-                      id: 'wiki-toolbar',
-                      type: 'toolbar',
-                      title: '操作',
-                      actions: [
+                      id: WORKBENCH_ACTION_ID.analyze,
+                      label: '开始分析',
+                      description: '启动 AI 扫描任务（分块 -> 向量化 -> 索引）',
+                      variant: 'primary',
+                      payload: {
+                        action: WORKBENCH_ACTION_ID.analyze,
+                        repoPath: '',
+                        model: '__auto__',
+                        language: DEFAULT_WIKI_LANGUAGE,
+                        analysisDepth: DEFAULT_ANALYSIS_DEPTH,
+                        scanMode: pluginConfig.scanMode,
+                        subagentCount: pluginConfig.defaultSubagentCount,
+                        maxFileBytesForFullAnalyze: pluginConfig.maxFileBytesForFullAnalyze,
+                        saveAsDefault: false,
+                        knowledgeBaseId,
+                      },
+                      inputs: [
                         {
-                          id: WORKBENCH_ACTION_ID.analyze,
-                          label: '开始分析',
-                          description: '启动 AI 扫描任务（分块 -> 向量化 -> 索引）',
-                          variant: 'primary',
-                          payload: {
-                            action: WORKBENCH_ACTION_ID.analyze,
-                            repoPath: '',
-                            model: '__auto__',
-                            language: DEFAULT_WIKI_LANGUAGE,
-                            analysisDepth: DEFAULT_ANALYSIS_DEPTH,
-                            knowledgeBaseId,
-                          },
-                          inputs: [
+                          key: 'repoPath',
+                          label: '仓库路径',
+                          type: 'path',
+                          required: true,
+                          placeholder: '请输入本地仓库绝对路径，例如 /Users/me/project',
+                        },
+                        {
+                          key: 'model',
+                          label: '扫描模型',
+                          type: 'model-select',
+                          required: true,
+                          defaultValue: '__auto__',
+                        },
+                        {
+                          key: 'language',
+                          label: '输出语言',
+                          type: 'select',
+                          required: true,
+                          defaultValue: DEFAULT_WIKI_LANGUAGE,
+                          options: [
                             {
-                              key: 'repoPath',
-                              label: '仓库路径',
-                              type: 'path',
-                              required: true,
-                              placeholder: '请输入本地仓库绝对路径，例如 /Users/me/project',
+                              label: '中文',
+                              value: 'zh',
                             },
                             {
-                              key: 'model',
-                              label: '扫描模型',
-                              type: 'model-select',
-                              required: true,
-                              defaultValue: '__auto__',
-                            },
-                            {
-                              key: 'language',
-                              label: '输出语言',
-                              type: 'select',
-                              required: true,
-                              defaultValue: DEFAULT_WIKI_LANGUAGE,
-                              options: [
-                                {
-                                  label: '中文',
-                                  value: 'zh',
-                                },
-                                {
-                                  label: 'English',
-                                  value: 'en',
-                                },
-                              ],
-                            },
-                            {
-                              key: 'analysisDepth',
-                              label: '分析深度',
-                              type: 'select',
-                              required: true,
-                              defaultValue: DEFAULT_ANALYSIS_DEPTH,
-                              options: [
-                                {
-                                  label: '深度',
-                                  value: 'deep',
-                                },
-                                {
-                                  label: '标准',
-                                  value: 'standard',
-                                },
-                              ],
-                            },
-                            {
-                              key: 'knowledgeBaseId',
-                              label: '文档库 ID',
-                              type: 'text',
-                              placeholder: '可选，默认根据仓库名称推导',
+                              label: 'English',
+                              value: 'en',
                             },
                           ],
                         },
                         {
-                          id: WORKBENCH_ACTION_ID.getLatest,
-                          label: '读取最新结果',
-                          variant: 'secondary',
-                          payload: {
-                            action: WORKBENCH_ACTION_ID.getLatest,
-                          },
+                          key: 'analysisDepth',
+                          label: '分析深度',
+                          type: 'select',
+                          required: true,
+                          defaultValue: DEFAULT_ANALYSIS_DEPTH,
+                          options: [
+                            {
+                              label: '深度',
+                              value: 'deep',
+                            },
+                            {
+                              label: '标准',
+                              value: 'standard',
+                            },
+                          ],
+                        },
+                        {
+                          key: 'scanMode',
+                          label: '扫描模式',
+                          type: 'select',
+                          required: true,
+                          defaultValue: pluginConfig.scanMode,
+                          options: [
+                            {
+                              label: '智能模式（遵循 .gitignore）',
+                              value: 'smart',
+                            },
+                            {
+                              label: '全量模式（尽量全扫）',
+                              value: 'full',
+                            },
+                          ],
+                        },
+                        {
+                          key: 'subagentCount',
+                          label: '并行 Subagent 数',
+                          type: 'number',
+                          required: true,
+                          min: 1,
+                          max: MAX_SUBAGENT_COUNT,
+                          step: 1,
+                          defaultValue: pluginConfig.defaultSubagentCount,
+                        },
+                        {
+                          key: 'maxFileBytesForFullAnalyze',
+                          label: '全文分析大小上限（字节）',
+                          type: 'number',
+                          required: false,
+                          min: 131072,
+                          max: 8388608,
+                          step: 65536,
+                          defaultValue: pluginConfig.maxFileBytesForFullAnalyze,
+                        },
+                        {
+                          key: 'knowledgeBaseId',
+                          label: '文档库 ID',
+                          type: 'text',
+                          placeholder: '可选，默认根据仓库名称推导',
+                        },
+                        {
+                          key: 'saveAsDefault',
+                          label: '保存为默认配置',
+                          description: '将本次并行数、扫描模式和大小上限写入 wiki/config.json',
+                          type: 'boolean',
+                          defaultValue: false,
                         },
                       ],
                     },
                     {
-                      id: 'wiki-task-status',
-                      type: 'task-status',
-                      title: '扫描任务状态',
-                      taskId,
-                      taskType: 'ai-indexing-scan',
-                      controlActions: getControlActions(taskSnapshot),
-                      emptyText: '尚未启动扫描任务。请先执行”开始分析”。',
-                    },
-                    {
-                      id: 'wiki-doc-chat',
-                      type: 'document-chat',
-                      title: '继续聊天（基于文档库）',
-                      knowledgeBaseId,
-                      placeholder: '请输入问题，基于最近扫描结果继续提问...',
-                      emptyText: '完成扫描后即可继续聊天。',
-                      model: latestTask && typeof latestTask.model === 'string' ? latestTask.model : undefined,
-                      topK: 6,
+                      id: WORKBENCH_ACTION_ID.getLatest,
+                      label: '读取最新结果',
+                      variant: 'secondary',
+                      payload: {
+                        action: WORKBENCH_ACTION_ID.getLatest,
+                      },
                     },
                   ],
                 },
                 {
-                  id: 'wiki-main',
-                  type: 'panel',
-                  title: 'Wiki 阅读区',
-                  children: [
-                    {
-                      id: 'wiki-markdown',
-                      type: 'markdown',
-                      title: '最新 Wiki Markdown',
-                      sourcePath: LATEST_MD_PATH,
-                      content: latestMarkdown ?? '',
-                      emptyText: '还没有分析结果，请先执行”开始分析”。',
-                    },
-                  ],
+                  id: 'wiki-task-status',
+                  type: 'task-status',
+                  title: '扫描任务状态',
+                  taskId,
+                  taskType: 'ai-indexing-scan',
+                  controlActions: getControlActions(taskSnapshot),
+                  emptyText: '尚未启动扫描任务。请先执行”开始分析”。',
+                },
+                {
+                  id: 'wiki-doc-chat',
+                  type: 'document-chat',
+                  title: '继续聊天（基于文档库）',
+                  knowledgeBaseId,
+                  placeholder: '请输入问题，基于最近扫描结果继续提问...',
+                  emptyText: '完成扫描后即可继续聊天。',
+                  model: latestTask && typeof latestTask.model === 'string' ? latestTask.model : undefined,
+                  topK: 6,
+                },
+              ],
+            },
+            {
+              id: 'wiki-main-panel',
+              type: 'panel',
+              title: 'Wiki 阅读区',
+              children: [
+                {
+                  id: 'wiki-markdown',
+                  type: 'markdown',
+                  title: '最新 Wiki 文档',
+                  sourcePath: LATEST_MD_PATH,
+                  content: effectiveMarkdown,
+                  pages: markdownPages,
+                  activePageId,
+                  tocScope: 'global',
+                  emptyText: '还没有分析结果，请先执行”开始分析”。',
                 },
               ],
             },

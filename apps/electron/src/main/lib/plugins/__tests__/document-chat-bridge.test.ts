@@ -9,11 +9,49 @@ import { pluginTaskRuntime } from '../task-runtime'
 mock.module('@proma/core', () => {
   return {
     getAdapter: () => ({
-      buildStreamRequest: () => ({}),
+      buildStreamRequest: (input: { userMessage?: string }) => ({
+        userMessage: input.userMessage ?? '',
+      }),
       providerType: 'openai',
     }),
-    streamSSE: async (args: any) => {
-      args.onEvent({ type: 'chunk', delta: 'ok' })
+    streamSSE: async (args: { request: { userMessage?: string }; onEvent: (event: { type: string; delta?: string }) => void }) => {
+      const prompt = args.request.userMessage ?? ''
+      if (prompt.includes('输出 JSON schema') || prompt.includes('output JSON schema')) {
+        args.onEvent({
+          type: 'chunk',
+          delta: JSON.stringify({
+            core: ['README.md', 'src/feature.ts'],
+            supporting: [],
+            peripheral: [],
+            modules: [{ name: 'feature-module', files: ['src/feature.ts'] }],
+          }),
+        })
+      } else if (prompt.includes('"summary": string')) {
+        args.onEvent({
+          type: 'chunk',
+          delta: JSON.stringify({
+            summary: 'feature 模块提供核心能力。',
+            keyFlows: ['输入 -> feature 处理 -> 输出'],
+            risks: [],
+            evidence: ['src/feature.ts'],
+          }),
+        })
+      } else if (prompt.includes('主文档 Agent') && prompt.includes('"pages"')) {
+        args.onEvent({
+          type: 'chunk',
+          delta: JSON.stringify({
+            pages: [
+              { id: 'index', content: '# 仓库 Wiki\n\n## 覆盖范围\n- core: 2' },
+              { id: 'architecture', content: '# 架构总览\n\n## 核心模块\n- feature-module' },
+              { id: 'runtime', content: '# 运行链路\n\n## 关键执行流\n- 输入 -> 输出' },
+              { id: 'modules', content: '# 模块明细\n\n- feature-module' },
+              { id: 'data-risks', content: '# 数据与风险\n\n- 风险较低' },
+            ],
+          }),
+        })
+      } else {
+        args.onEvent({ type: 'chunk', delta: 'ok' })
+      }
       args.onEvent({ type: 'done' })
     },
   }

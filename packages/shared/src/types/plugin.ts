@@ -291,6 +291,18 @@ export interface PluginWorkbenchToolbarNode extends PluginWorkbenchBaseNode {
 }
 
 /** Markdown 展示节点 */
+export interface PluginWorkbenchMarkdownPage {
+  /** 页面 ID（用于切换、锚点跳转） */
+  id: string
+  /** 页面标题 */
+  title: string
+  /** 直接渲染的 markdown 文本 */
+  content?: string
+  /** 从插件工作区读取的 markdown 文件路径 */
+  sourcePath?: string
+}
+
+/** Markdown 展示节点 */
 export interface PluginWorkbenchMarkdownNode extends PluginWorkbenchBaseNode {
   type: 'markdown'
   /** 直接渲染的 markdown 文本 */
@@ -299,6 +311,12 @@ export interface PluginWorkbenchMarkdownNode extends PluginWorkbenchBaseNode {
   sourcePath?: string
   /** 当内容为空时的提示文案 */
   emptyText?: string
+  /** 多页 Markdown（可选，向后兼容单页 content/sourcePath） */
+  pages?: PluginWorkbenchMarkdownPage[]
+  /** 当前激活页面 ID */
+  activePageId?: string
+  /** 目录范围 */
+  tocScope?: 'global' | 'current'
 }
 
 /** 任务运行态节点 */
@@ -489,6 +507,9 @@ export type PluginWikiLanguage = 'zh' | 'en'
 /** AI 分析深度 */
 export type PluginAiAnalysisDepth = 'standard' | 'deep'
 
+/** AI 扫描模式 */
+export type PluginAiScanMode = 'smart' | 'full'
+
 /** 索引分块策略 */
 export interface PluginAiIndexChunkStrategy {
   maxChunkChars: number
@@ -530,6 +551,8 @@ export interface PluginAiIndexSummary {
   metadata: PluginAiIndexMetadata
   indexPath: string
   markdownPath: string
+  generationMode?: 'single-page' | 'multi-page'
+  pages?: Array<{ id: string; title: string; path: string }>
 }
 
 /** 启动 AI 扫描任务输入 */
@@ -540,6 +563,9 @@ export interface PluginStartAiIndexingTaskInput {
   model?: string
   language?: PluginWikiLanguage
   analysisDepth?: PluginAiAnalysisDepth
+  scanMode?: PluginAiScanMode
+  subagentCount?: number
+  maxFileBytesForFullAnalyze?: number
   chunkStrategy?: Partial<PluginAiIndexChunkStrategy>
 }
 

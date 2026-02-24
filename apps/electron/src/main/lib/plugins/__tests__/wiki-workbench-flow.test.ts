@@ -107,8 +107,21 @@ describe('wiki-local-repository-plugin workbench flow', () => {
             workspaceFiles.set('wiki/latest.md', '# Latest wiki markdown')
             workspaceFiles.set('wiki/latest-index-summary.json', JSON.stringify({
               knowledgeBaseId: 'repo-kb',
+              pages: [
+                { id: 'index', title: '首页', path: 'wiki/pages/index.md' },
+                { id: 'architecture', title: '架构总览', path: 'wiki/pages/architecture.md' },
+              ],
             }))
-            workspaceFiles.set('wiki/latest.json', JSON.stringify({ ok: true }))
+            workspaceFiles.set('wiki/latest.json', JSON.stringify({
+              ok: true,
+              activePageId: 'index',
+              pages: [
+                { id: 'index', title: '首页', path: 'wiki/pages/index.md' },
+                { id: 'architecture', title: '架构总览', path: 'wiki/pages/architecture.md' },
+              ],
+            }))
+            workspaceFiles.set('wiki/pages/index.md', '# 首页\\n\\n## 总览')
+            workspaceFiles.set('wiki/pages/architecture.md', '# 架构总览\\n\\n## 模块')
             return { success: true, task: currentTask }
           },
           stopTask: async () => ({ success: true, task: currentTask }),
@@ -124,6 +137,8 @@ describe('wiki-local-repository-plugin workbench flow', () => {
               model: 'test-model',
               language: 'zh',
               analysisDepth: 'standard',
+              scanMode: 'smart',
+              subagentCount: 4,
               chunkStrategy: {
                 maxChunkChars: 1200,
                 overlapChars: 120,
@@ -137,6 +152,11 @@ describe('wiki-local-repository-plugin workbench flow', () => {
             },
             indexPath: '/tmp/index.json',
             markdownPath: '/tmp/latest.md',
+            generationMode: 'multi-page',
+            pages: [
+              { id: 'index', title: '首页', path: 'wiki/pages/index.md' },
+              { id: 'architecture', title: '架构总览', path: 'wiki/pages/architecture.md' },
+            ],
           }),
         },
         documentChat: {
@@ -172,6 +192,8 @@ describe('wiki-local-repository-plugin workbench flow', () => {
         model: 'test-model',
         language: 'en',
         analysisDepth: 'standard',
+        scanMode: 'smart',
+        subagentCount: 4,
       },
     })
     expect(analyze.success).toBe(true)
@@ -201,14 +223,25 @@ describe('wiki-local-repository-plugin workbench flow', () => {
     }
 
     const root = canvasResult.data.root
-    const split = root.children.find((item: (typeof root.children)[number]) => item.type === 'split')
-    expect(split).toBeDefined()
-    if (split && split.type === 'split') {
-      const leftPanel = split.children.find((item: (typeof split.children)[number]) => item.type === 'panel' && item.id === 'wiki-sidebar')
-      expect(leftPanel).toBeDefined()
-      if (leftPanel && leftPanel.type === 'panel') {
-        expect(leftPanel.children.some((item: (typeof leftPanel.children)[number]) => item.type === 'task-status')).toBe(true)
-        expect(leftPanel.children.some((item: (typeof leftPanel.children)[number]) => item.type === 'document-chat')).toBe(true)
+    const controlsPanel = root.children.find(
+      (item: (typeof root.children)[number]) => item.type === 'panel' && item.id === 'wiki-controls-panel',
+    )
+    expect(controlsPanel).toBeDefined()
+    if (controlsPanel && controlsPanel.type === 'panel') {
+      expect(controlsPanel.children.some((item: (typeof controlsPanel.children)[number]) => item.type === 'task-status')).toBe(true)
+      expect(controlsPanel.children.some((item: (typeof controlsPanel.children)[number]) => item.type === 'document-chat')).toBe(true)
+    }
+
+    const mainPanel = root.children.find(
+      (item: (typeof root.children)[number]) => item.type === 'panel' && item.id === 'wiki-main-panel',
+    )
+    expect(mainPanel).toBeDefined()
+    if (mainPanel && mainPanel.type === 'panel') {
+      const markdownNode = mainPanel.children.find((item) => item.type === 'markdown')
+      expect(markdownNode).toBeDefined()
+      if (markdownNode && markdownNode.type === 'markdown') {
+        expect((markdownNode.pages ?? []).length).toBeGreaterThan(0)
+        expect(markdownNode.tocScope).toBe('global')
       }
     }
   })
