@@ -995,48 +995,49 @@ export async function runAgent(
         )
       : undefined
 
+    const queryOptions: import('@anthropic-ai/claude-agent-sdk').Options & Record<string, unknown> = {
+      pathToClaudeCodeExecutable: cliPath,
+      executable: agentExec.type,
+      executableArgs,
+      model: modelId || 'claude-sonnet-4-5-20250929',
+      maxTurns: 30,
+      // 权限模式：auto 使用 bypass，其他使用 default
+      permissionMode: permissionMode === 'auto' ? 'bypassPermissions' : 'default',
+      allowDangerouslySkipPermissions: permissionMode === 'auto',
+      // 自定义权限处理器（非 auto 模式才注入）
+      ...(canUseTool && { canUseTool }),
+      // 只读工具白名单（SDK 级别，跳过 canUseTool 回调）
+      // 注意：AskUserQuestion 不在 SAFE_TOOLS 中，会走 canUseTool 以展示交互式 UI
+      ...(permissionMode !== 'auto' && { allowedTools: [...SAFE_TOOLS] }),
+      includePartialMessages: true,
+      promptSuggestions: true,
+      cwd: agentCwd,
+      abortController: controller,
+      env: sdkEnv,
+      // 静态 system prompt（利用 prompt caching）
+      systemPrompt: {
+        type: 'preset' as const,
+        preset: 'claude_code' as const,
+        append: buildSystemPromptAppend({
+          workspaceName: workspace?.name,
+          workspaceSlug,
+          sessionId,
+        }),
+      },
+      // 衔接上下文：有 SDK session ID 则 resume
+      ...(existingSdkSessionId ? { resume: existingSdkSessionId } : {}),
+      // MCP 服务器（每次 query 都从磁盘读取最新配置，支持回合间动态更新）
+      ...(Object.keys(mcpServers).length > 0 && { mcpServers: mcpServers as Record<string, import('@anthropic-ai/claude-agent-sdk').McpServerConfig> }),
+      // Skill 插件（SDK 自动发现 skills/ 目录下的 SKILL.md）
+      ...(workspaceSlug && { plugins: [{ type: 'local' as const, path: getAgentWorkspacePath(workspaceSlug) }] }),
+      stderr: (data: string) => {
+        stderrChunks.push(data)
+        console.error(`[Agent SDK stderr] ${data}`)
+      },
+    }
     const queryIterator = sdk.query({
       prompt: finalPrompt,
-      options: {
-        pathToClaudeCodeExecutable: cliPath,
-        executable: agentExec.type,
-        executableArgs,
-        model: modelId || 'claude-sonnet-4-5-20250929',
-        maxTurns: 30,
-        // 权限模式：auto 使用 bypass，其他使用 default
-        permissionMode: permissionMode === 'auto' ? 'bypassPermissions' : 'default',
-        allowDangerouslySkipPermissions: permissionMode === 'auto',
-        // 自定义权限处理器（非 auto 模式才注入）
-        ...(canUseTool && { canUseTool }),
-        // 只读工具白名单（SDK 级别，跳过 canUseTool 回调）
-        // 注意：AskUserQuestion 不在 SAFE_TOOLS 中，会走 canUseTool 以展示交互式 UI
-        ...(permissionMode !== 'auto' && { allowedTools: [...SAFE_TOOLS] }),
-        includePartialMessages: true,
-        promptSuggestions: true,
-        cwd: agentCwd,
-        abortController: controller,
-        env: sdkEnv,
-        // 静态 system prompt（利用 prompt caching）
-        systemPrompt: {
-          type: 'preset' as const,
-          preset: 'claude_code' as const,
-          append: buildSystemPromptAppend({
-            workspaceName: workspace?.name,
-            workspaceSlug,
-            sessionId,
-          }),
-        },
-        // 衔接上下文：有 SDK session ID 则 resume
-        ...(existingSdkSessionId ? { resume: existingSdkSessionId } : {}),
-        // MCP 服务器（每次 query 都从磁盘读取最新配置，支持回合间动态更新）
-        ...(Object.keys(mcpServers).length > 0 && { mcpServers: mcpServers as Record<string, import('@anthropic-ai/claude-agent-sdk').McpServerConfig> }),
-        // Skill 插件（SDK 自动发现 skills/ 目录下的 SKILL.md）
-        ...(workspaceSlug && { plugins: [{ type: 'local' as const, path: getAgentWorkspacePath(workspaceSlug) }] }),
-        stderr: (data: string) => {
-          stderrChunks.push(data)
-          console.error(`[Agent SDK stderr] ${data}`)
-        },
-      },
+      options: queryOptions,
     })
 
     console.log(`[Agent 服务] SDK query 已创建，开始遍历消息流...`)
