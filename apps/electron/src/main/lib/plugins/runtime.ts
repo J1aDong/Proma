@@ -52,7 +52,13 @@ import {
   getPluginWorkspacesDir,
 } from '../config-paths'
 import { createPluginRuntimeContext } from './api-facade'
-import { getLatestIndexSummary, startAiIndexingTask } from './ai-indexing-service'
+import {
+  getLatestIndexSummary,
+  getPersistedTaskSnapshot,
+  markPersistedTaskState,
+  recoverAiIndexingTasks,
+  startAiIndexingTask,
+} from './ai-indexing-service'
 import { pluginDocumentChatBridge } from './document-chat-bridge'
 import { loadPluginModule } from './loader'
 import {
@@ -539,6 +545,13 @@ export async function enablePlugin(input: PluginLifecycleInput): Promise<PluginO
       await module.activate(context)
     }
 
+    if (record.id === 'wiki-local-repository-plugin') {
+      await recoverAiIndexingTasks({
+        pluginId: record.id,
+        workspacePath: record.workspacePath,
+      })
+    }
+
     const updated = updatePluginState(record.id, 'active')
     activePluginRuntimeMap.set(record.id, {
       record: updated,
@@ -950,39 +963,138 @@ export async function startPluginAiIndexingTask(
       model: input.model,
       language: input.language,
       analysisDepth: input.analysisDepth,
+      scanMode: input.scanMode,
+      subagentCount: input.subagentCount,
+      maxFileBytesForFullAnalyze: input.maxFileBytesForFullAnalyze,
       chunkStrategy: input.chunkStrategy,
     },
   })
 }
 
 /** 暂停插件任务 */
-export function pausePluginTask(input: PluginTaskControlInput): PluginTaskOperationResult {
-  return pluginTaskRuntime.pauseTask(input.pluginId, input.taskId)
+export async function pausePluginTask(input: PluginTaskControlInput): Promise<PluginTaskOperationResult> {
+  const runtimeResult = pluginTaskRuntime.pauseTask(input.pluginId, input.taskId)
+  if (runtimeResult.success) {
+    return runtimeResult
+  }
+
+  const persisted = await getPersistedTaskSnapshot(input.pluginId, input.taskId)
+  if (!persisted) {
+    return runtimeResult
+  }
+
+  await markPersistedTaskState({
+    taskId: input.taskId,
+    state: 'paused',
+  })
+
+  return {
+    success: true,
+    task: {
+      ...persisted,
+      state: 'paused',
+      updatedAt: new Date().toISOString(),
+    },
+  }
 }
 
 /** 继续插件任务 */
-export function resumePluginTask(input: PluginTaskControlInput): PluginTaskOperationResult {
-  return pluginTaskRuntime.resumeTask(input.pluginId, input.taskId)
+export async function resumePluginTask(input: PluginTaskControlInput): Promise<PluginTaskOperationResult> {
+  const runtimeResult = pluginTaskRuntime.resumeTask(input.pluginId, input.taskId)
+  if (runtimeResult.success) {
+    return runtimeResult
+  }
+
+  const persisted = await getPersistedTaskSnapshot(input.pluginId, input.taskId)
+  if (!persisted) {
+    return runtimeResult
+  }
+
+  const record = getPluginRecord(input.pluginId)
+  if (!record) {
+    return {
+      success: false,
+      error: `插件不存在: ${input.pluginId}`,
+    }
+  }
+
+  const metadata = persisted.metadata ?? {}
+  const repositoryPath = typeof metadata.repositoryPath === 'string' ? metadata.repositoryPath : ''
+  if (!repositoryPath) {
+    return {
+      success: false,
+      error: `任务缺少 repositoryPath，无法恢复: ${input.taskId}`,
+    }
+  }
+
+  return startAiIndexingTask({
+    pluginId: input.pluginId,
+    workspacePath: record.workspacePath,
+    taskId: input.taskId,
+    payload: {
+      repositoryPath,
+      knowledgeBaseId: typeof metadata.knowledgeBaseId === 'string' ? metadata.knowledgeBaseId : undefined,
+      model: typeof metadata.model === 'string' ? metadata.model : undefined,
+      language: metadata.language === 'en' ? 'en' : 'zh',
+      analysisDepth: metadata.analysisDepth === 'deep' ? 'deep' : 'standard',
+      scanMode: metadata.scanMode === 'full' ? 'full' : 'smart',
+      subagentCount: typeof metadata.subagentCount === 'number' ? metadata.subagentCount : undefined,
+      maxFileBytesForFullAnalyze: typeof metadata.maxFileBytesForFullAnalyze === 'number'
+        ? metadata.maxFileBytesForFullAnalyze
+        : undefined,
+    },
+  })
 }
 
 /** 停止插件任务 */
-export function stopPluginTask(input: PluginTaskControlInput): PluginTaskOperationResult {
-  return pluginTaskRuntime.stopTask(input.pluginId, input.taskId)
+export async function stopPluginTask(input: PluginTaskControlInput): Promise<PluginTaskOperationResult> {
+  const runtimeResult = pluginTaskRuntime.stopTask(input.pluginId, input.taskId)
+  if (runtimeResult.success) {
+    return runtimeResult
+  }
+
+  const persisted = await getPersistedTaskSnapshot(input.pluginId, input.taskId)
+  if (!persisted) {
+    return runtimeResult
+  }
+
+  await markPersistedTaskState({
+    taskId: input.taskId,
+    state: 'stopped',
+  })
+
+  return {
+    success: true,
+    task: {
+      ...persisted,
+      state: 'stopped',
+      completedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    },
+  }
 }
 
 /** 查询插件任务状态 */
-export function getPluginTaskStatus(input: PluginTaskStatusInput): PluginTaskOperationResult {
+export async function getPluginTaskStatus(input: PluginTaskStatusInput): Promise<PluginTaskOperationResult> {
   const task = pluginTaskRuntime.getTaskForPlugin(input.pluginId, input.taskId)
-  if (!task) {
+  if (task) {
     return {
-      success: false,
-      error: `任务不存在: ${input.taskId}`,
+      success: true,
+      task,
+    }
+  }
+
+  const persisted = await getPersistedTaskSnapshot(input.pluginId, input.taskId)
+  if (persisted) {
+    return {
+      success: true,
+      task: persisted,
     }
   }
 
   return {
-    success: true,
-    task,
+    success: false,
+    error: `任务不存在: ${input.taskId}`,
   }
 }
 
@@ -1420,6 +1532,75 @@ function isWorkbenchNode(value: unknown): boolean {
 
       if (value.emptyText !== undefined && typeof value.emptyText !== 'string') {
         return false
+      }
+
+      if (value.activePageId !== undefined && typeof value.activePageId !== 'string') {
+        return false
+      }
+
+      if (value.tocScope !== undefined && value.tocScope !== 'global' && value.tocScope !== 'current') {
+        return false
+      }
+
+      if (value.pages !== undefined) {
+        if (!Array.isArray(value.pages)) {
+          return false
+        }
+        const pagesValid = value.pages.every((page) => {
+          if (!isObjectRecord(page)) {
+            return false
+          }
+          if (typeof page.id !== 'string' || page.id.trim().length === 0) {
+            return false
+          }
+          if (typeof page.title !== 'string' || page.title.trim().length === 0) {
+            return false
+          }
+          if (page.content !== undefined && typeof page.content !== 'string') {
+            return false
+          }
+          if (page.sourcePath !== undefined && typeof page.sourcePath !== 'string') {
+            return false
+          }
+          return true
+        })
+        if (!pagesValid) {
+          return false
+        }
+      }
+
+      if (value.activeRepositoryId !== undefined && typeof value.activeRepositoryId !== 'string') {
+        return false
+      }
+
+      if (value.repositoryList !== undefined) {
+        if (!Array.isArray(value.repositoryList)) {
+          return false
+        }
+        const repositoryListValid = value.repositoryList.every((item) => {
+          if (!isObjectRecord(item)) {
+            return false
+          }
+          if (typeof item.id !== 'string' || item.id.trim().length === 0) {
+            return false
+          }
+          if (typeof item.repoPath !== 'string' || item.repoPath.trim().length === 0) {
+            return false
+          }
+          if (typeof item.knowledgeBaseId !== 'string' || item.knowledgeBaseId.trim().length === 0) {
+            return false
+          }
+          if (item.updatedAt !== undefined && typeof item.updatedAt !== 'string') {
+            return false
+          }
+          if (item.lastScannedAt !== undefined && typeof item.lastScannedAt !== 'string') {
+            return false
+          }
+          return true
+        })
+        if (!repositoryListValid) {
+          return false
+        }
       }
 
       return true

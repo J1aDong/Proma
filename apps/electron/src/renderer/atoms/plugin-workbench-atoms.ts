@@ -39,6 +39,20 @@ export const pluginWorkbenchCanvasErrorCodeAtom = atom<string | null>(null)
 /** 动作执行中状态（key = pluginId:actionId） */
 export const pluginWorkbenchActionPendingMapAtom = atom<Record<string, boolean>>({})
 
+function shouldRefreshCanvasAfterAction(input: PluginInvokeWorkbenchActionInput): boolean {
+  if (input.pluginId !== 'wiki-local-repository-plugin') {
+    return true
+  }
+
+  const actionId = input.action.actionId
+  // Wiki 任务控制主要依赖 task event 局部更新，避免每次刷新画布导致闪烁。
+  if (actionId === 'pause-task' || actionId === 'resume-task' || actionId === 'stop-task') {
+    return false
+  }
+
+  return true
+}
+
 /** 当前选中的工作台插件项 */
 export const selectedPluginWorkbenchItemAtom = atom((get) => {
   const selectedId = get(selectedPluginWorkbenchIdAtom)
@@ -193,10 +207,12 @@ export const invokePluginWorkbenchActionAtom = atom(
         return result
       }
 
-      await set(loadPluginWorkbenchCanvasAtom, {
-        pluginId: input.pluginId,
-        reason: 'refresh',
-      })
+      if (shouldRefreshCanvasAfterAction(input)) {
+        await set(loadPluginWorkbenchCanvasAtom, {
+          pluginId: input.pluginId,
+          reason: 'refresh',
+        })
+      }
 
       return result
     } catch (error) {

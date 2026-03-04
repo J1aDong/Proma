@@ -230,6 +230,16 @@ bun run generate:icons    # 生成应用图标
 - **`ai-elements/`**：AI 展示组件 — Markdown 渲染、代码块、Mermaid 图、推理折叠、上下文分割线、富文本输入
 - **`ui/`**：ShadcnUI 组件（new-york 风格，CSS 变量主题）
 
+### 插件工作台二次开发约束（Fork 合并友好）
+
+为降低后续与上游同步时的冲突成本，插件相关 UI 改造必须遵守：
+
+1. **禁止直接修改** `renderer/components/agent/*` 与 `renderer/components/chat/*` 业务模块代码。
+2. 允许在插件内**引用已有通用原语**（如 `ai-elements`、`ui`、`ModelSelector` 等），并在 `renderer/components/plugin-workbench/` 下封装适配组件（建议放到 `plugin-workbench/base/`）。
+3. 插件样式与交互应优先通过**组合封装**实现，不复制粘贴整段 Agent/Chat 业务逻辑。
+4. 若必须新增能力，优先加在插件自身目录与 `@proma/shared` 类型层，避免侵入 Agent/Chat 主链路。
+5. Wiki 插件中的会话定位为**只读 Chat 问答**（基于索引与证据解释），不引入 Agent 工具执行能力。
+
 ### 全局 Hooks（`renderer/hooks/`）
 
 | Hook | 职责 |

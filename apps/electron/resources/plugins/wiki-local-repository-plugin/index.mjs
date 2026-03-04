@@ -13,6 +13,7 @@ const LATEST_MD_PATH = 'wiki/latest.md'
 const LATEST_TASK_PATH = 'wiki/latest-task.json'
 const LATEST_INDEX_SUMMARY_PATH = 'wiki/latest-index-summary.json'
 const WIKI_CONFIG_PATH = 'wiki/config.json'
+const REPOSITORY_REGISTRY_PATH = 'wiki/repository-registry.json'
 
 const WORKBENCH_ERROR_CODE = {
   pluginNotActive: 'PLUGIN_NOT_ACTIVE',
@@ -22,10 +23,12 @@ const WORKBENCH_ERROR_CODE = {
 
 const WORKBENCH_ACTION_ID = {
   analyze: 'analyze',
-  getLatest: 'get-latest',
   pauseTask: 'pause-task',
   resumeTask: 'resume-task',
   stopTask: 'stop-task',
+  addRepository: 'add-repository',
+  removeRepository: 'remove-repository',
+  activateRepository: 'activate-repository',
 }
 
 const DEFAULT_WIKI_LANGUAGE = 'zh'
@@ -252,11 +255,254 @@ function toWikiPluginConfig(raw) {
 }
 
 /**
+ * @param {string | undefined} raw
+ * @param {string} fallback
+ * @returns {string}
+ */
+function sanitizeKnowledgeBaseId(raw, fallback = 'default-kb') {
+  const base = typeof raw === 'string' && raw.trim().length > 0 ? raw.trim() : fallback
+  const normalized = base
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+  return normalized || 'default-kb'
+}
+
+/**
+ * @returns {string}
+ */
+function nowIso() {
+  return new Date().toISOString()
+}
+
+/**
+ * @typedef {{
+ *   id: string
+ *   repoPath: string
+ *   knowledgeBaseId: string
+ *   createdAt: string
+ *   updatedAt: string
+ *   lastScannedAt?: string
+ * }} RepositoryRegistryItem
+ */
+
+/**
+ * @typedef {{
+ *   activeRepositoryId?: string
+ *   repositories: RepositoryRegistryItem[]
+ * }} RepositoryRegistry
+ */
+
+/**
+ * @param {unknown} raw
+ * @returns {RepositoryRegistryItem[]}
+ */
+function normalizeRepositoryItems(raw) {
+  if (!Array.isArray(raw)) {
+    return []
+  }
+
+  return raw
+    .map((item) => {
+      if (!item || typeof item !== 'object') {
+        return null
+      }
+      const candidate = /** @type {{
+       *   id?: unknown
+       *   repoPath?: unknown
+       *   knowledgeBaseId?: unknown
+       *   createdAt?: unknown
+       *   updatedAt?: unknown
+       *   lastScannedAt?: unknown
+       * }} */ (item)
+      const repoPath = typeof candidate.repoPath === 'string' ? candidate.repoPath.trim() : ''
+      const knowledgeBaseId = sanitizeKnowledgeBaseId(
+        typeof candidate.knowledgeBaseId === 'string' ? candidate.knowledgeBaseId : '',
+        repoPath.split(/[\\/]/).filter(Boolean).pop() ?? 'default-kb',
+      )
+      if (!repoPath) {
+        return null
+      }
+      const createdAt = typeof candidate.createdAt === 'string' && candidate.createdAt.trim().length > 0
+        ? candidate.createdAt.trim()
+        : nowIso()
+      const updatedAt = typeof candidate.updatedAt === 'string' && candidate.updatedAt.trim().length > 0
+        ? candidate.updatedAt.trim()
+        : createdAt
+      return {
+        id: typeof candidate.id === 'string' && candidate.id.trim().length > 0
+          ? candidate.id.trim()
+          : repoPath,
+        repoPath,
+        knowledgeBaseId,
+        createdAt,
+        updatedAt,
+        lastScannedAt: typeof candidate.lastScannedAt === 'string' && candidate.lastScannedAt.trim().length > 0
+          ? candidate.lastScannedAt.trim()
+          : undefined,
+      }
+    })
+    .filter((item) => item !== null)
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+}
+
+/**
+ * @param {unknown} raw
+ * @returns {RepositoryRegistry}
+ */
+function toRepositoryRegistry(raw) {
+  if (Array.isArray(raw)) {
+    const repositories = normalizeRepositoryItems(raw)
+    return {
+      activeRepositoryId: repositories[0]?.id,
+      repositories,
+    }
+  }
+
+  if (!raw || typeof raw !== 'object') {
+    return {
+      repositories: [],
+    }
+  }
+
+  const candidate = /** @type {{ activeRepositoryId?: unknown; repositories?: unknown }} */ (raw)
+  const repositories = normalizeRepositoryItems(candidate.repositories)
+  const activeRepositoryId = typeof candidate.activeRepositoryId === 'string' && candidate.activeRepositoryId.trim().length > 0
+    ? candidate.activeRepositoryId.trim()
+    : repositories[0]?.id
+
+  return {
+    activeRepositoryId,
+    repositories,
+  }
+}
+
+/**
  * @returns {Promise<WikiPluginConfig>}
  */
 async function readPluginConfig() {
   const raw = await readWorkspaceJsonIfExists(WIKI_CONFIG_PATH)
   return toWikiPluginConfig(raw)
+}
+
+/**
+ * @returns {Promise<RepositoryRegistry>}
+ */
+async function readRepositoryRegistry() {
+  const raw = await readWorkspaceJsonIfExists(REPOSITORY_REGISTRY_PATH)
+  return toRepositoryRegistry(raw)
+}
+
+/**
+ * @param {RepositoryRegistry} registry
+ */
+async function writeRepositoryRegistry(registry) {
+  if (!runtimeContext) {
+    return
+  }
+
+  await runtimeContext.api.fs.writeText(
+    REPOSITORY_REGISTRY_PATH,
+    JSON.stringify(registry, null, 2),
+  )
+}
+
+/**
+ * @param {RepositoryRegistry} registry
+ * @param {{
+ *   repoPath: string
+ *   knowledgeBaseId: string
+ *   markScanned?: boolean
+ * }} input
+ * @returns {RepositoryRegistry}
+ */
+function upsertRepository(registry, input) {
+  const now = nowIso()
+  const repoPath = resolve(input.repoPath)
+  const repositoryId = repoPath
+  const knowledgeBaseId = sanitizeKnowledgeBaseId(input.knowledgeBaseId, repoPath.split(/[\\/]/).filter(Boolean).pop() ?? 'default-kb')
+  const currentList = registry.repositories ?? []
+  const existed = currentList.find((item) => item.id === repositoryId || item.repoPath === repoPath)
+
+  const nextItem = existed
+    ? {
+      ...existed,
+      id: repositoryId,
+      repoPath,
+      knowledgeBaseId,
+      updatedAt: now,
+      lastScannedAt: input.markScanned ? now : existed.lastScannedAt,
+    }
+    : {
+      id: repositoryId,
+      repoPath,
+      knowledgeBaseId,
+      createdAt: now,
+      updatedAt: now,
+      lastScannedAt: input.markScanned ? now : undefined,
+    }
+
+  const repositories = [
+    nextItem,
+    ...currentList.filter((item) => item.id !== repositoryId && item.repoPath !== repoPath),
+  ]
+
+  return {
+    activeRepositoryId: repositoryId,
+    repositories,
+  }
+}
+
+/**
+ * @param {RepositoryRegistry} registry
+ * @param {string} repositoryId
+ * @returns {RepositoryRegistry}
+ */
+function removeRepository(registry, repositoryId) {
+  const repositories = (registry.repositories ?? []).filter((item) => item.id !== repositoryId)
+  const activeRepositoryId = registry.activeRepositoryId === repositoryId
+    ? repositories[0]?.id
+    : registry.activeRepositoryId
+
+  return {
+    activeRepositoryId,
+    repositories,
+  }
+}
+
+/**
+ * @param {RepositoryRegistry} registry
+ * @param {string} repositoryId
+ * @returns {RepositoryRegistry}
+ */
+function activateRepository(registry, repositoryId) {
+  const repositories = [...(registry.repositories ?? [])]
+  const existed = repositories.find((item) => item.id === repositoryId)
+  if (!existed) {
+    return registry
+  }
+
+  return {
+    activeRepositoryId: repositoryId,
+    repositories,
+  }
+}
+
+/**
+ * @param {RepositoryRegistry} registry
+ * @returns {RepositoryRegistryItem | null}
+ */
+function getActiveRepository(registry) {
+  const repositories = registry.repositories ?? []
+  if (repositories.length === 0) {
+    return null
+  }
+
+  if (!registry.activeRepositoryId) {
+    return repositories[0] ?? null
+  }
+
+  return repositories.find((item) => item.id === registry.activeRepositoryId) ?? repositories[0] ?? null
 }
 
 /**
@@ -428,12 +674,19 @@ async function runCapabilityAction(payload) {
       throw new Error(startResult.error ?? '启动扫描任务失败')
     }
 
+    const resolvedKnowledgeBaseId = sanitizeKnowledgeBaseId(
+      typeof startResult.task.metadata?.knowledgeBaseId === 'string'
+        ? startResult.task.metadata.knowledgeBaseId
+        : knowledgeBaseId,
+      repoPath.split(/[\\/]/).filter(Boolean).pop() ?? 'default-kb',
+    )
+
     await writeLatestTask({
       taskId: startResult.task.taskId,
       taskType: startResult.task.taskType,
       state: startResult.task.state,
       repositoryPath: repoPath,
-      knowledgeBaseId: startResult.task.metadata?.knowledgeBaseId,
+      knowledgeBaseId: resolvedKnowledgeBaseId,
       model: startResult.task.metadata?.model,
       language: startResult.task.metadata?.language,
       analysisDepth: startResult.task.metadata?.analysisDepth,
@@ -442,6 +695,14 @@ async function runCapabilityAction(payload) {
       maxFileBytesForFullAnalyze,
       updatedAt: startResult.task.updatedAt,
     })
+
+    const repositoryRegistry = await readRepositoryRegistry()
+    const nextRepositoryRegistry = upsertRepository(repositoryRegistry, {
+      repoPath,
+      knowledgeBaseId: resolvedKnowledgeBaseId,
+      markScanned: false,
+    })
+    await writeRepositoryRegistry(nextRepositoryRegistry)
 
     return {
       success: true,
@@ -487,20 +748,77 @@ async function runCapabilityAction(payload) {
     }
   }
 
-  if (action === WORKBENCH_ACTION_ID.getLatest) {
+  if (action === WORKBENCH_ACTION_ID.addRepository) {
     runtimeContext.lifecycle.throwIfAborted()
 
-    const summary = await runtimeContext.api.aiIndexing.getLatestIndexSummary()
-    const markdown = await readWorkspaceFileIfExists(LATEST_MD_PATH)
-    const latest = await readWorkspaceJsonIfExists(LATEST_JSON_PATH)
+    const repoPath = normalizeRepoPath(normalizedPayload)
+    const fallbackKnowledgeBaseId = repoPath.split(/[\\/]/).filter(Boolean).pop() ?? 'default-kb'
+    const knowledgeBaseId = sanitizeKnowledgeBaseId(
+      typeof normalizedPayload.knowledgeBaseId === 'string' ? normalizedPayload.knowledgeBaseId : '',
+      fallbackKnowledgeBaseId,
+    )
+    const repositoryRegistry = await readRepositoryRegistry()
+    const nextRepositoryRegistry = upsertRepository(repositoryRegistry, {
+      repoPath,
+      knowledgeBaseId,
+      markScanned: false,
+    })
+    await writeRepositoryRegistry(nextRepositoryRegistry)
 
     return {
       success: true,
-      action: WORKBENCH_ACTION_ID.getLatest,
-      markdown: markdown ?? '',
-      latest,
-      indexSummary: summary,
-      pages: summary?.pages ?? [],
+      action,
+      repositoryRegistry: nextRepositoryRegistry,
+    }
+  }
+
+  if (action === WORKBENCH_ACTION_ID.removeRepository) {
+    runtimeContext.lifecycle.throwIfAborted()
+
+    const repositoryId = typeof normalizedPayload.repositoryId === 'string'
+      && normalizedPayload.repositoryId.trim().length > 0
+      ? normalizedPayload.repositoryId.trim()
+      : typeof normalizedPayload.repoPath === 'string' && normalizedPayload.repoPath.trim().length > 0
+        ? resolve(normalizedPayload.repoPath.trim())
+        : ''
+
+    if (!repositoryId) {
+      throw new Error('缺少 repositoryId 参数')
+    }
+
+    const repositoryRegistry = await readRepositoryRegistry()
+    const nextRepositoryRegistry = removeRepository(repositoryRegistry, repositoryId)
+    await writeRepositoryRegistry(nextRepositoryRegistry)
+
+    return {
+      success: true,
+      action,
+      repositoryRegistry: nextRepositoryRegistry,
+    }
+  }
+
+  if (action === WORKBENCH_ACTION_ID.activateRepository) {
+    runtimeContext.lifecycle.throwIfAborted()
+
+    const repositoryId = typeof normalizedPayload.repositoryId === 'string'
+      && normalizedPayload.repositoryId.trim().length > 0
+      ? normalizedPayload.repositoryId.trim()
+      : typeof normalizedPayload.repoPath === 'string' && normalizedPayload.repoPath.trim().length > 0
+        ? resolve(normalizedPayload.repoPath.trim())
+        : ''
+
+    if (!repositoryId) {
+      throw new Error('缺少 repositoryId 参数')
+    }
+
+    const repositoryRegistry = await readRepositoryRegistry()
+    const nextRepositoryRegistry = activateRepository(repositoryRegistry, repositoryId)
+    await writeRepositoryRegistry(nextRepositoryRegistry)
+
+    return {
+      success: true,
+      action,
+      repositoryRegistry: nextRepositoryRegistry,
     }
   }
 
@@ -535,35 +853,128 @@ export async function getWorkbenchCanvas() {
   }
 
   try {
-    const latestMarkdown = await readWorkspaceFileIfExists(LATEST_MD_PATH)
-    const latestJson = await readWorkspaceJsonIfExists(LATEST_JSON_PATH)
     const latestTask = await readWorkspaceJsonIfExists(LATEST_TASK_PATH)
-    const latestIndexSummary = await readWorkspaceJsonIfExists(LATEST_INDEX_SUMMARY_PATH)
     const pluginConfig = await readPluginConfig()
+    let repositoryRegistry = await readRepositoryRegistry()
+    const latestTaskRepoPath = latestTask && typeof latestTask.repositoryPath === 'string'
+      ? latestTask.repositoryPath.trim()
+      : ''
+    const latestTaskKnowledgeBaseId = sanitizeKnowledgeBaseId(
+      typeof latestTask?.knowledgeBaseId === 'string' ? latestTask.knowledgeBaseId : '',
+      latestTaskRepoPath.split(/[\\/]/).filter(Boolean).pop() ?? 'default-kb',
+    )
 
-    const summaryPages = normalizePageSummaries(latestIndexSummary?.pages ?? latestJson?.pages)
-    const markdownPages = await loadMarkdownPages(summaryPages)
-    const hasMultiPages = markdownPages.length > 0
-    const activePageId = typeof latestJson?.activePageId === 'string' && latestJson.activePageId.trim().length > 0
-      ? latestJson.activePageId.trim()
-      : hasMultiPages
-        ? markdownPages[0]?.id
-        : undefined
-    const effectiveMarkdown = hasMultiPages
-      ? ''
-      : (latestMarkdown ?? '')
+    if (latestTaskRepoPath) {
+      const hasLatestTaskRepo = repositoryRegistry.repositories.some(
+        (item) => item.repoPath === latestTaskRepoPath,
+      )
+      if (!hasLatestTaskRepo) {
+        repositoryRegistry = upsertRepository(repositoryRegistry, {
+          repoPath: latestTaskRepoPath,
+          knowledgeBaseId: latestTaskKnowledgeBaseId,
+          markScanned: false,
+        })
+        await writeRepositoryRegistry(repositoryRegistry)
+      }
+    }
 
+    const activeRepository = getActiveRepository(repositoryRegistry)
+    const preferredKnowledgeBaseId = activeRepository?.knowledgeBaseId || latestTaskKnowledgeBaseId || 'default-kb'
     const taskId = latestTask && typeof latestTask.taskId === 'string' ? latestTask.taskId : undefined
     const taskStatus = taskId
       ? await runtimeContext.api.aiIndexing.getTaskStatus({ taskId })
       : null
-
     const taskSnapshot = taskStatus?.success ? taskStatus.task : undefined
-    const knowledgeBaseId = latestIndexSummary && typeof latestIndexSummary.knowledgeBaseId === 'string'
-      ? latestIndexSummary.knowledgeBaseId
-      : taskSnapshot?.metadata && typeof taskSnapshot.metadata.knowledgeBaseId === 'string'
+    const taskState = taskSnapshot?.state
+    const taskRunning = taskState === 'running' || taskState === 'paused'
+    const taskRepositoryPath = typeof taskSnapshot?.metadata?.repositoryPath === 'string'
+      ? resolve(taskSnapshot.metadata.repositoryPath)
+      : ''
+    const taskKnowledgeBaseId = sanitizeKnowledgeBaseId(
+      typeof taskSnapshot?.metadata?.knowledgeBaseId === 'string'
         ? taskSnapshot.metadata.knowledgeBaseId
-        : 'default-kb'
+        : '',
+      preferredKnowledgeBaseId,
+    )
+    const activeRepositoryPath = activeRepository?.repoPath ? resolve(activeRepository.repoPath) : ''
+    const isTaskForActiveRepository = taskRunning
+      && (
+        (activeRepositoryPath && taskRepositoryPath && activeRepositoryPath === taskRepositoryPath)
+        || taskKnowledgeBaseId === preferredKnowledgeBaseId
+      )
+    const taskDetail = typeof taskSnapshot?.progress?.detail === 'string'
+      && taskSnapshot.progress.detail.trim().length > 0
+      ? taskSnapshot.progress.detail.trim()
+      : taskState === 'paused'
+        ? '任务已暂停，可在状态区继续。'
+        : '正在分析仓库，请稍候...'
+    const markdownEmptyText = isTaskForActiveRepository
+      ? `正在分析：${taskDetail}`
+      : '还没有分析结果，请先执行”开始分析”。'
+
+    if (taskSnapshot?.state === 'completed' && taskRepositoryPath) {
+      const completedRepository = repositoryRegistry.repositories.find((item) => resolve(item.repoPath) === taskRepositoryPath)
+      if (!completedRepository?.lastScannedAt) {
+        repositoryRegistry = upsertRepository(repositoryRegistry, {
+          repoPath: taskRepositoryPath,
+          knowledgeBaseId: taskKnowledgeBaseId,
+          markScanned: true,
+        })
+        await writeRepositoryRegistry(repositoryRegistry)
+      }
+    }
+
+    const latestIndexSummary = await runtimeContext.api.aiIndexing.getLatestIndexSummary(preferredKnowledgeBaseId)
+    const latestJson = await readWorkspaceJsonIfExists(LATEST_JSON_PATH)
+    const latestJsonKnowledgeBaseId = typeof latestJson?.indexSummary?.knowledgeBaseId === 'string'
+      ? latestJson.indexSummary.knowledgeBaseId
+      : ''
+    const canFallbackToLatestJson = !preferredKnowledgeBaseId || latestJsonKnowledgeBaseId === preferredKnowledgeBaseId
+    const markdownSourcePath = typeof latestIndexSummary?.markdownPath === 'string'
+      && latestIndexSummary.markdownPath.trim().length > 0
+      ? latestIndexSummary.markdownPath.trim()
+      : canFallbackToLatestJson
+        ? LATEST_MD_PATH
+        : ''
+    const latestMarkdown = markdownSourcePath
+      ? await readWorkspaceFileIfExists(markdownSourcePath)
+      : null
+
+    const summaryPages = normalizePageSummaries(
+      latestIndexSummary?.pages ?? (canFallbackToLatestJson ? latestJson?.pages : undefined),
+    )
+    const loadedMarkdownPages = await loadMarkdownPages(summaryPages)
+    const markdownPages = isTaskForActiveRepository ? [] : loadedMarkdownPages
+    const hasMultiPages = markdownPages.length > 0
+    const latestActivePageId = typeof latestJson?.activePageId === 'string' && latestJson.activePageId.trim().length > 0
+      ? latestJson.activePageId.trim()
+      : ''
+    const activePageId = latestActivePageId && markdownPages.some((item) => item.id === latestActivePageId)
+      ? latestActivePageId
+      : hasMultiPages
+        ? markdownPages[0]?.id
+        : undefined
+    const effectiveMarkdown = isTaskForActiveRepository
+      ? ''
+      : hasMultiPages
+        ? ''
+        : (latestMarkdown ?? '')
+
+    const knowledgeBaseId = activeRepository?.knowledgeBaseId
+      ? activeRepository.knowledgeBaseId
+      : latestIndexSummary && typeof latestIndexSummary.knowledgeBaseId === 'string'
+        ? latestIndexSummary.knowledgeBaseId
+        : taskSnapshot?.metadata && typeof taskSnapshot.metadata.knowledgeBaseId === 'string'
+          ? taskSnapshot.metadata.knowledgeBaseId
+          : 'default-kb'
+    const defaultRepoPath = activeRepository?.repoPath || latestTaskRepoPath || ''
+    const repositoryList = (repositoryRegistry.repositories ?? []).map((item) => ({
+      id: item.id,
+      repoPath: item.repoPath,
+      knowledgeBaseId: item.knowledgeBaseId,
+      updatedAt: item.updatedAt,
+      lastScannedAt: item.lastScannedAt,
+    }))
 
     return {
       success: true,
@@ -578,7 +989,7 @@ export async function getWorkbenchCanvas() {
             {
               id: 'wiki-controls-panel',
               type: 'panel',
-              title: '控制与会话',
+              title: '控制台',
               children: [
                 {
                   id: 'wiki-toolbar',
@@ -592,7 +1003,7 @@ export async function getWorkbenchCanvas() {
                       variant: 'primary',
                       payload: {
                         action: WORKBENCH_ACTION_ID.analyze,
-                        repoPath: '',
+                        repoPath: defaultRepoPath,
                         model: '__auto__',
                         language: DEFAULT_WIKI_LANGUAGE,
                         analysisDepth: DEFAULT_ANALYSIS_DEPTH,
@@ -703,14 +1114,6 @@ export async function getWorkbenchCanvas() {
                         },
                       ],
                     },
-                    {
-                      id: WORKBENCH_ACTION_ID.getLatest,
-                      label: '读取最新结果',
-                      variant: 'secondary',
-                      payload: {
-                        action: WORKBENCH_ACTION_ID.getLatest,
-                      },
-                    },
                   ],
                 },
                 {
@@ -725,9 +1128,9 @@ export async function getWorkbenchCanvas() {
                 {
                   id: 'wiki-doc-chat',
                   type: 'document-chat',
-                  title: '继续聊天（基于文档库）',
+                  title: '继续聊天（只读，基于文档库）',
                   knowledgeBaseId,
-                  placeholder: '请输入问题，基于最近扫描结果继续提问...',
+                  placeholder: '只读问答：先定位 Wiki，再下钻源码证据...',
                   emptyText: '完成扫描后即可继续聊天。',
                   model: latestTask && typeof latestTask.model === 'string' ? latestTask.model : undefined,
                   topK: 6,
@@ -743,12 +1146,14 @@ export async function getWorkbenchCanvas() {
                   id: 'wiki-markdown',
                   type: 'markdown',
                   title: '最新 Wiki 文档',
-                  sourcePath: LATEST_MD_PATH,
+                  sourcePath: isTaskForActiveRepository ? undefined : (markdownSourcePath || undefined),
                   content: effectiveMarkdown,
                   pages: markdownPages,
                   activePageId,
                   tocScope: 'global',
-                  emptyText: '还没有分析结果，请先执行”开始分析”。',
+                  repositoryList,
+                  activeRepositoryId: repositoryRegistry.activeRepositoryId,
+                  emptyText: markdownEmptyText,
                 },
               ],
             },
@@ -775,10 +1180,12 @@ export async function invokeWorkbenchAction(action) {
   const actionId = action?.actionId
   if (
     actionId !== WORKBENCH_ACTION_ID.analyze
-    && actionId !== WORKBENCH_ACTION_ID.getLatest
     && actionId !== WORKBENCH_ACTION_ID.pauseTask
     && actionId !== WORKBENCH_ACTION_ID.resumeTask
     && actionId !== WORKBENCH_ACTION_ID.stopTask
+    && actionId !== WORKBENCH_ACTION_ID.addRepository
+    && actionId !== WORKBENCH_ACTION_ID.removeRepository
+    && actionId !== WORKBENCH_ACTION_ID.activateRepository
   ) {
     return createWorkbenchError(WORKBENCH_ERROR_CODE.actionInvalid, `不支持的工作台动作: ${String(actionId)}`)
   }
@@ -793,8 +1200,12 @@ export async function invokeWorkbenchAction(action) {
 
     const message = actionId === WORKBENCH_ACTION_ID.analyze
       ? '扫描任务已启动，可在状态区查看进度。'
-      : actionId === WORKBENCH_ACTION_ID.getLatest
-        ? '已读取最新结果。'
+      : actionId === WORKBENCH_ACTION_ID.addRepository
+          ? '仓库已加入列表。'
+          : actionId === WORKBENCH_ACTION_ID.removeRepository
+            ? '仓库已从列表移除。'
+            : actionId === WORKBENCH_ACTION_ID.activateRepository
+              ? '已切换当前仓库。'
         : `任务控制命令已发送：${actionId}`
 
     return {

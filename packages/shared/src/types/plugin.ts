@@ -302,6 +302,20 @@ export interface PluginWorkbenchMarkdownPage {
   sourcePath?: string
 }
 
+/** Wiki 仓库列表项（可选，用于插件扩展场景） */
+export interface PluginWorkbenchRepositoryItem {
+  /** 仓库条目 ID */
+  id: string
+  /** 仓库绝对路径 */
+  repoPath: string
+  /** 关联知识库 ID */
+  knowledgeBaseId: string
+  /** 最近更新时间 */
+  updatedAt?: string
+  /** 最近一次扫描时间 */
+  lastScannedAt?: string
+}
+
 /** Markdown 展示节点 */
 export interface PluginWorkbenchMarkdownNode extends PluginWorkbenchBaseNode {
   type: 'markdown'
@@ -317,6 +331,10 @@ export interface PluginWorkbenchMarkdownNode extends PluginWorkbenchBaseNode {
   activePageId?: string
   /** 目录范围 */
   tocScope?: 'global' | 'current'
+  /** Wiki 仓库列表（插件可选扩展字段） */
+  repositoryList?: PluginWorkbenchRepositoryItem[]
+  /** 当前激活仓库 ID */
+  activeRepositoryId?: string
 }
 
 /** 任务运行态节点 */

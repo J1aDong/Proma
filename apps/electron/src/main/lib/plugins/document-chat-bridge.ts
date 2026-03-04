@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
+import { resolve } from 'node:path'
 import type {
   PluginDocumentChatEvent,
   PluginDocumentChatHistoryInput,
@@ -13,6 +15,15 @@ import { getAdapter, streamSSE } from '@proma/core'
 import { getEffectiveProxyUrl } from '../proxy-settings-service'
 import { getFetchFn } from '../proxy-fetch'
 import { resolveChannelAndModel } from './model-resolution'
+
+const LATEST_INDEX_SUMMARY_PATH = 'wiki/latest-index-summary.json'
+
+interface WikiPageContext {
+  id: string
+  title: string
+  path: string
+  content: string
+}
 
 interface ChatSessionRecord {
   pluginId: string
@@ -57,31 +68,170 @@ function cosineSimilarity(left: number[], right: number[]): number {
   return dot / (Math.sqrt(normLeft) * Math.sqrt(normRight))
 }
 
-function splitIntoDeltas(content: string, segmentSize = 64): string[] {
-  const output: string[] = []
-  for (let cursor = 0; cursor < content.length; cursor += segmentSize) {
-    output.push(content.slice(cursor, cursor + segmentSize))
+function extractSnippet(content: string, maxChars = 260): string {
+  const normalized = content
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .join('\n')
+
+  if (normalized.length <= maxChars) {
+    return normalized
   }
+
+  return `${normalized.slice(0, maxChars)}...`
+}
+
+function extractFilePathHintsFromWikiPages(pages: WikiPageContext[]): Set<string> {
+  const hints = new Set<string>()
+  const patterns = [
+    /`([^`\n]+\.[a-zA-Z0-9]+)`/g,
+    /([A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+\.[A-Za-z0-9]+)/g,
+  ]
+
+  for (const page of pages) {
+    for (const pattern of patterns) {
+      let matched = pattern.exec(page.content)
+      while (matched) {
+        const value = matched[1]?.trim()
+        if (value) {
+          hints.add(value)
+        }
+        matched = pattern.exec(page.content)
+      }
+    }
+  }
+
+  return hints
+}
+
+async function readWorkspaceJsonIfExists<T>(workspacePath: string, relativePath: string): Promise<T | null> {
+  try {
+    const absolutePath = resolve(workspacePath, relativePath)
+    const content = await readFile(absolutePath, 'utf-8')
+    return JSON.parse(content) as T
+  } catch {
+    return null
+  }
+}
+
+async function readWorkspaceTextIfExists(workspacePath: string, relativePath: string): Promise<string | null> {
+  try {
+    const absolutePath = resolve(workspacePath, relativePath)
+    return await readFile(absolutePath, 'utf-8')
+  } catch {
+    return null
+  }
+}
+
+async function loadWikiPagesForKnowledgeBase(input: {
+  workspacePath: string
+  knowledgeBaseId: string
+}): Promise<WikiPageContext[]> {
+  const summary = await readWorkspaceJsonIfExists<{
+    knowledgeBaseId?: string
+    pages?: Array<{ id?: string; title?: string; path?: string }>
+  }>(input.workspacePath, LATEST_INDEX_SUMMARY_PATH)
+
+  const normalizedKb = input.knowledgeBaseId.trim()
+  const summaryPages = summary
+    && typeof summary.knowledgeBaseId === 'string'
+    && summary.knowledgeBaseId === normalizedKb
+    && Array.isArray(summary.pages)
+      ? summary.pages
+      : []
+
+  const normalizedPages = summaryPages
+    .map((item) => ({
+      id: typeof item?.id === 'string' ? item.id.trim() : '',
+      title: typeof item?.title === 'string' ? item.title.trim() : '',
+      path: typeof item?.path === 'string' ? item.path.trim() : '',
+    }))
+    .filter((item) => item.id.length > 0 && item.title.length > 0 && item.path.length > 0)
+
+  const fallbackPages = [
+    { id: 'index', title: '首页', path: `wiki/knowledge-bases/${normalizedKb}/pages/index.md` },
+    { id: 'architecture', title: '架构总览', path: `wiki/knowledge-bases/${normalizedKb}/pages/architecture.md` },
+    { id: 'runtime', title: '运行链路', path: `wiki/knowledge-bases/${normalizedKb}/pages/runtime.md` },
+    { id: 'modules', title: '模块明细', path: `wiki/knowledge-bases/${normalizedKb}/pages/modules.md` },
+    { id: 'data-risks', title: '数据与风险', path: `wiki/knowledge-bases/${normalizedKb}/pages/data-risks.md` },
+  ]
+
+  const pagesToLoad = normalizedPages.length > 0 ? normalizedPages : fallbackPages
+  const output: WikiPageContext[] = []
+
+  for (const page of pagesToLoad) {
+    const content = await readWorkspaceTextIfExists(input.workspacePath, page.path)
+    if (!content) {
+      continue
+    }
+    output.push({
+      id: page.id,
+      title: page.title,
+      path: page.path,
+      content,
+    })
+  }
+
   return output
 }
 
-function buildAnswerText(input: {
+function buildDocumentChatPrompt(input: {
   question: string
   knowledgeBaseId: string
+  wikiPages: WikiPageContext[]
   references: PluginDocumentChatReference[]
-}): string {
-  const bullets = input.references
+}): { systemMessage: string; mergedReferences: PluginDocumentChatReference[] } {
+  const wikiReferences = input.wikiPages.map((page) => ({
+    chunkId: `wiki:${page.id}`,
+    filePath: page.path,
+    score: 1,
+    snippet: extractSnippet(page.content, 200),
+  }))
+
+  const mergedReferences = [...wikiReferences, ...input.references]
+  const wikiSection = input.wikiPages.length > 0
+    ? input.wikiPages
+      .map((page, index) => [
+        `### Wiki-${index + 1}: ${page.title} (${page.path})`,
+        '```markdown',
+        extractSnippet(page.content, 1000),
+        '```',
+      ].join('\n'))
+      .join('\n\n')
+    : '无可用 Wiki 页面，请优先依据源码证据回答。'
+
+  const sourceBullets = input.references
     .map((item, index) => {
-      return `${index + 1}. (${item.filePath}) ${item.snippet}`
+      return `${index + 1}. ${item.filePath}\n${item.snippet}`
     })
     .join('\n')
 
-  return [
-    `基于知识库 \`${input.knowledgeBaseId}\`，我检索了与问题最相关的片段。`,
-    `问题：${input.question}`,
+  const systemMessage = [
+    '你是仓库 Wiki 助手，请严格基于证据回答。',
+    `当前知识库：${input.knowledgeBaseId}`,
+    '回答要求：',
+    '- 当前是只读问答模式，不执行代码、不调用工具、不提供写入动作；',
+    '- 先根据 Wiki 章节定位问题语义，再下钻源码片段给出结论；',
+    '- 回答中明确区分「Wiki 结论」与「源码证据」；',
+    '- 每条关键结论都要标注来源文件路径；',
+    '- 若证据不足，请明确说明不确定点，不要编造。',
     '',
-    bullets || '未检索到有效片段，请先重新扫描仓库。',
+    '## Wiki 关键上下文',
+    wikiSection,
+    '',
+    '## 源码语义检索结果',
+    sourceBullets || '未检索到有效源码片段。',
+    '',
+    `## 用户问题`,
+    input.question,
   ].join('\n')
+
+  return {
+    systemMessage,
+    mergedReferences,
+  }
 }
 
 export class PluginDocumentChatBridge {
@@ -167,21 +317,41 @@ export class PluginDocumentChatBridge {
 
       const topK = Math.max(1, Math.min(20, Math.floor(input.payload.topK ?? 6)))
       const queryEmbedding = computeEmbedding(userQuestion)
+      const wikiPages = await loadWikiPagesForKnowledgeBase({
+        workspacePath: input.workspacePath,
+        knowledgeBaseId,
+      })
+      const rankedWikiPages = wikiPages
+        .map((page) => ({
+          page,
+          score: cosineSimilarity(queryEmbedding, computeEmbedding(page.content.slice(0, 4000))),
+        }))
+        .sort((a, b) => b.score - a.score)
+      const selectedWikiPages = rankedWikiPages.slice(0, 3).map((item) => item.page)
+      const wikiFileHintCandidates = [...extractFilePathHintsFromWikiPages(selectedWikiPages)].slice(0, 40)
+      const wikiFileHints = new Set(wikiFileHintCandidates)
       const references: PluginDocumentChatReference[] = knowledgeBase.chunks
         .map((chunk) => {
+          const score = cosineSimilarity(queryEmbedding, chunk.embedding)
+          const pathBoost = wikiFileHints.has(chunk.filePath)
+            ? 0.12
+            : wikiFileHintCandidates.some((hint) => hint.length > 0 && chunk.filePath.endsWith(hint))
+              ? 0.07
+              : 0
           return {
             chunkId: chunk.id,
             filePath: chunk.filePath,
-            score: cosineSimilarity(queryEmbedding, chunk.embedding),
-            snippet: chunk.content.slice(0, 220),
+            score: score + pathBoost,
+            snippet: extractSnippet(chunk.content, 240),
           }
         })
         .sort((a, b) => b.score - a.score)
         .slice(0, topK)
 
-      const systemMessage = buildAnswerText({
+      const { systemMessage, mergedReferences } = buildDocumentChatPrompt({
         question: userQuestion,
         knowledgeBaseId,
+        wikiPages: selectedWikiPages,
         references,
       })
 
@@ -192,25 +362,31 @@ export class PluginDocumentChatBridge {
       }
       session.messages.push(assistantMessage)
 
-      if (references.length > 0) {
+      if (mergedReferences.length > 0) {
         this.emit({
           type: 'citation',
           pluginId: input.pluginId,
           knowledgeBaseId,
           sessionId: normalizedSessionId,
           model: resolvedModel,
-          references,
+          references: mergedReferences,
           timestamp: nowIso(),
         })
       }
 
       // 组装历史消息
-      const historyForProvider = incomingMessages.slice(0, -1).map(msg => ({
-        id: randomUUID(),
-        role: msg.role === 'user' ? 'user' : 'assistant' as 'user' | 'assistant',
-        content: msg.content,
-        createdAt: new Date(msg.createdAt ?? nowIso()).getTime(),
-      }))
+      const historyForProvider = session.messages
+        .slice(0, -1)
+        .filter((message) => message.role === 'user' || message.role === 'assistant')
+        .map((msg) => {
+          const role: 'user' | 'assistant' = msg.role === 'user' ? 'user' : 'assistant'
+          return {
+            id: randomUUID(),
+            role,
+            content: msg.content,
+            createdAt: new Date(msg.createdAt ?? nowIso()).getTime(),
+          }
+        })
 
       // 调用适配器获取真实数据
       const request = adapter.buildStreamRequest({

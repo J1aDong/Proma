@@ -371,6 +371,24 @@ export function getPluginWorkspacePath(pluginId: string): string {
 }
 
 /**
+ * 获取 Wiki 插件持久化目录
+ *
+ * 如果目录不存在则自动创建。
+ *
+ * @returns ~/.proma/plugin_wiki/
+ */
+export function getPluginWikiRootDir(): string {
+  const dir = join(getConfigDir(), 'plugin_wiki')
+
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true })
+    console.log(`[配置] 已创建 Wiki 持久化目录: ${dir}`)
+  }
+
+  return dir
+}
+
+/**
  * 获取默认 Skills 模板目录路径
  *
  * 新建工作区时自动复制此目录的内容到工作区 skills/ 下。

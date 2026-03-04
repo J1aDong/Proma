@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, extname, join, relative, resolve } from 'node:path'
@@ -10,6 +10,7 @@ import type {
   PluginAiIndexSummary,
   PluginStartAiIndexingTaskInput,
   PluginTaskOperationResult,
+  PluginTaskSnapshot,
 } from '@proma/shared'
 import { getAgentModelIdFromSettings } from '../settings-service'
 import { pluginTaskRuntime } from './task-runtime'
@@ -17,12 +18,21 @@ import { getAdapter, streamSSE } from '@proma/core'
 import { getEffectiveProxyUrl } from '../proxy-settings-service'
 import { getFetchFn } from '../proxy-fetch'
 import { resolveChannelAndModel } from './model-resolution'
+import {
+  appendWikiTaskEvent,
+  applyWikiTaskSnapshot,
+  createWikiTaskRecord,
+  listRecoverableWikiTasks,
+  persistWikiTaskArtifacts,
+  updateWikiTaskRecord,
+} from './wiki-task-persistence'
 
 const INDEX_VERSION = 'plugin-ai-index-v1'
 const DEFAULT_SCAN_MODE: PluginAiScanMode = 'smart'
 const DEFAULT_SUBAGENT_COUNT = 4
 const MAX_SUBAGENT_COUNT = 8
 const DEFAULT_MAX_FILE_BYTES_FOR_FULL_ANALYZE = 700 * 1024
+const WIKI_LOCAL_REPOSITORY_PLUGIN_ID = 'wiki-local-repository-plugin'
 const DEFAULT_CHUNK_STRATEGY: PluginAiIndexChunkStrategy = {
   maxChunkChars: 1200,
   overlapChars: 120,
@@ -35,6 +45,9 @@ const TEXT_EXTENSIONS = new Set([
   '.html', '.xml', '.sql', '.proto', '.env', '.lock', '.tsx', '.tsx', '.tsx',
 ])
 const SKIP_DIRS = new Set(['.git', 'node_modules', '.next', 'dist', 'build', '.turbo', '.idea', '.vscode'])
+
+let taskPersistenceBindingReady = false
+const latestProgressFingerprintMap = new Map<string, string>()
 
 interface RepositoryFileManifestItem {
   relPath: string
@@ -114,6 +127,39 @@ interface DirectoryInsight {
   chunkCount: number
 }
 
+interface FileContentClue {
+  filePath: string
+  symbols: string[]
+  snippet: string
+}
+
+interface ArchitectureTopologyLayer {
+  name: string
+  modules: string[]
+}
+
+interface ArchitectureTopologyDependency {
+  from: string
+  to: string
+  reason: string
+}
+
+interface ArchitectureTopologyFlow {
+  name: string
+  steps: string[]
+}
+
+interface ArchitectureTopology {
+  layers: ArchitectureTopologyLayer[]
+  dependencies: ArchitectureTopologyDependency[]
+  criticalFlows: ArchitectureTopologyFlow[]
+  entryModules: string[]
+}
+
+function nowIso(): string {
+  return new Date().toISOString()
+}
+
 function stableHash(input: string): string {
   return createHash('sha1').update(input).digest('hex')
 }
@@ -158,6 +204,56 @@ function normalizeMaxFileBytes(raw: number | undefined): number {
   }
 
   return Math.max(128 * 1024, Math.min(8 * 1024 * 1024, Math.floor(numeric)))
+}
+
+function buildProgressFingerprint(progress: PluginTaskSnapshot['progress']): string {
+  if (!progress) {
+    return ''
+  }
+  return `${progress.stage}|${Math.round(progress.percent)}|${progress.detail ?? ''}`
+}
+
+function bindTaskPersistenceListener(): void {
+  if (taskPersistenceBindingReady) {
+    return
+  }
+
+  taskPersistenceBindingReady = true
+  pluginTaskRuntime.onEvent((event) => {
+    if (event.task.taskType !== 'ai-indexing-scan') {
+      return
+    }
+
+    const taskId = event.task.taskId
+    const nextFingerprint = buildProgressFingerprint(event.task.progress)
+    const prevFingerprint = latestProgressFingerprintMap.get(taskId) ?? ''
+    const shouldPersistProgress = event.type !== 'progress' || nextFingerprint !== prevFingerprint
+    if (!shouldPersistProgress) {
+      return
+    }
+
+    latestProgressFingerprintMap.set(taskId, nextFingerprint)
+
+    void (async () => {
+      await applyWikiTaskSnapshot(event.task)
+      await appendWikiTaskEvent({
+        taskId,
+        type: event.type,
+        timestamp: event.timestamp,
+        task: event.task,
+      })
+
+      if (
+        event.type === 'completed'
+        || event.type === 'failed'
+        || event.type === 'stopped'
+      ) {
+        latestProgressFingerprintMap.delete(taskId)
+      }
+    })().catch((error) => {
+      console.warn('[插件索引] 写入任务持久化事件失败:', error)
+    })
+  })
 }
 
 export function computeEmbedding(text: string): number[] {
@@ -205,6 +301,18 @@ function getKnowledgeBaseMetadataPath(workspacePath: string, knowledgeBaseId: st
 
 function getKnowledgeBaseChunksPath(workspacePath: string, knowledgeBaseId: string): string {
   return join(getKnowledgeBaseRoot(workspacePath, knowledgeBaseId), 'chunks.json')
+}
+
+function getKnowledgeBaseMarkdownPath(workspacePath: string, knowledgeBaseId: string): string {
+  return join(getKnowledgeBaseRoot(workspacePath, knowledgeBaseId), 'latest.md')
+}
+
+function getKnowledgeBasePagesRoot(workspacePath: string, knowledgeBaseId: string): string {
+  return join(getKnowledgeBaseRoot(workspacePath, knowledgeBaseId), 'pages')
+}
+
+function getKnowledgeBasePagePath(workspacePath: string, knowledgeBaseId: string, pageId: string): string {
+  return join(getKnowledgeBasePagesRoot(workspacePath, knowledgeBaseId), `${pageId}.md`)
 }
 
 function getLatestKnowledgeBasePointerPath(workspacePath: string): string {
@@ -282,6 +390,92 @@ function extractSnippet(content: string, maxChars = 360): string {
   }
 
   return `${normalized.slice(0, maxChars)}...`
+}
+
+function extractSymbolHints(content: string, limit = 8): string[] {
+  const patterns = [
+    /\bexport\s+(?:async\s+)?function\s+([A-Za-z_][\w$]*)/g,
+    /\bfunction\s+([A-Za-z_][\w$]*)\s*\(/g,
+    /\bclass\s+([A-Za-z_][\w$]*)/g,
+    /\binterface\s+([A-Za-z_][\w$]*)/g,
+    /\bconst\s+([A-Za-z_][\w$]*)\s*=\s*(?:async\s*)?\(/g,
+    /\btype\s+([A-Za-z_][\w$]*)\s*=/g,
+  ]
+
+  const dedup = new Set<string>()
+  for (const pattern of patterns) {
+    let matched = pattern.exec(content)
+    while (matched) {
+      const symbol = matched[1]?.trim()
+      if (symbol) {
+        dedup.add(symbol)
+      }
+      if (dedup.size >= limit) {
+        return [...dedup]
+      }
+      matched = pattern.exec(content)
+    }
+  }
+
+  return [...dedup]
+}
+
+function buildFileContentClues(input: {
+  textFiles: RepositoryTextFile[]
+  keyFiles: KeyFileInsight[]
+}): FileContentClue[] {
+  const textFileMap = new Map(input.textFiles.map((item) => [item.relPath, item.content]))
+  const selected = new Set<string>()
+  const output: FileContentClue[] = []
+
+  const append = (filePath: string): void => {
+    if (selected.has(filePath) || output.length >= 30) {
+      return
+    }
+
+    const content = textFileMap.get(filePath)
+    if (!content) {
+      return
+    }
+
+    selected.add(filePath)
+    output.push({
+      filePath,
+      symbols: extractSymbolHints(content, 10),
+      snippet: extractSnippet(content, 520),
+    })
+  }
+
+  for (const keyFile of input.keyFiles) {
+    append(keyFile.filePath)
+  }
+
+  for (const file of input.textFiles) {
+    if (output.length >= 30) {
+      break
+    }
+
+    const lower = file.relPath.toLowerCase()
+    if (
+      lower.includes('/src/')
+      || lower.includes('/app/')
+      || lower.endsWith('/main.ts')
+      || lower.endsWith('/main.tsx')
+      || lower.endsWith('/index.ts')
+      || lower.endsWith('/index.tsx')
+    ) {
+      append(file.relPath)
+    }
+  }
+
+  for (const file of input.textFiles) {
+    if (output.length >= 30) {
+      break
+    }
+    append(file.relPath)
+  }
+
+  return output
 }
 
 function getKeyFileReason(relPath: string): string | null {
@@ -1231,10 +1425,37 @@ async function classifyRepositoryFiles(input: {
   language: 'zh' | 'en' | string | undefined
   repositoryPath: string
   manifest: RepositoryFileManifestItem[]
+  contentClues: FileContentClue[]
+  dependencySignals: string[]
+  commandSignals: string[]
 }): Promise<CoreFileClassification> {
   const langInstruction = input.language === 'en'
     ? 'Respond in English.'
     : '请用中文输出。'
+
+  const clueBlocks = input.contentClues.length > 0
+    ? input.contentClues
+      .slice(0, 24)
+      .map((item) => {
+        const symbolLine = item.symbols.length > 0 ? item.symbols.join(', ') : '-'
+        return [
+          `### ${item.filePath}`,
+          `symbols: ${symbolLine}`,
+          '```text',
+          item.snippet,
+          '```',
+        ].join('\n')
+      })
+      .join('\n\n')
+    : '- (无内容线索)'
+
+  const dependencyLines = input.dependencySignals.length > 0
+    ? input.dependencySignals.slice(0, 30).map((item) => `- ${item}`).join('\n')
+    : '- (无依赖信号)'
+
+  const commandLines = input.commandSignals.length > 0
+    ? input.commandSignals.slice(0, 20).map((item) => `- ${item}`).join('\n')
+    : '- (无命令信号)'
 
   const userMessage = [
     '你是代码库分析规划器。请从文件清单中识别核心文件并输出 JSON。',
@@ -1246,11 +1467,21 @@ async function classifyRepositoryFiles(input: {
     '- supporting 是支撑实现；',
     '- peripheral 是边缘资产；',
     '- modules 请按语义模块分组，文件路径必须来自清单；',
+    '- 优先结合文件内容线索、符号和依赖信号，禁止仅靠文件名分组；',
     '- 禁止输出解释文字，只输出 JSON。',
     '',
     `仓库路径：${input.repositoryPath}`,
     '文件清单：',
     buildManifestDigest(input.manifest),
+    '',
+    '依赖信号：',
+    dependencyLines,
+    '',
+    '运行命令信号：',
+    commandLines,
+    '',
+    '文件内容线索：',
+    clueBlocks,
   ].join('\n')
 
   const output = await invokeModelToText({
@@ -1504,6 +1735,209 @@ async function runSemanticWorkers(input: {
   return output
 }
 
+function dedupeStrings(list: string[]): string[] {
+  return [...new Set(list.map((item) => item.trim()).filter((item) => item.length > 0))]
+}
+
+function buildFallbackArchitectureTopology(input: {
+  language: 'zh' | 'en' | string | undefined
+  modules: SemanticTaskResult[]
+}): ArchitectureTopology {
+  const isEn = input.language === 'en'
+  const moduleNames = input.modules.map((item) => item.name).slice(0, 12)
+  if (moduleNames.length === 0) {
+    return {
+      layers: [],
+      dependencies: [],
+      criticalFlows: [],
+      entryModules: [],
+    }
+  }
+
+  const entryCandidates = moduleNames.filter((name) => /entry|main|app|api|router|ui|command|cli/i.test(name))
+  const infraCandidates = moduleNames.filter((name) => /infra|storage|adapter|provider|gateway|database|cache|utils|sdk/i.test(name))
+  const domainCandidates = moduleNames.filter((name) => !entryCandidates.includes(name) && !infraCandidates.includes(name))
+
+  const layers: ArchitectureTopologyLayer[] = []
+  const appendLayer = (name: string, modules: string[]): void => {
+    const sanitized = dedupeStrings(modules).filter((item) => moduleNames.includes(item))
+    if (sanitized.length > 0) {
+      layers.push({
+        name,
+        modules: sanitized,
+      })
+    }
+  }
+
+  appendLayer(isEn ? 'Entry Layer' : '入口层', entryCandidates)
+  appendLayer(isEn ? 'Domain Layer' : '领域层', domainCandidates)
+  appendLayer(isEn ? 'Infrastructure Layer' : '基础设施层', infraCandidates)
+
+  if (layers.length === 0) {
+    appendLayer(isEn ? 'Core Layer' : '核心层', moduleNames)
+  }
+
+  const orderedModules = layers.flatMap((item) => item.modules)
+  const dependencies: ArchitectureTopologyDependency[] = []
+  for (let index = 0; index < orderedModules.length - 1; index += 1) {
+    const from = orderedModules[index]
+    const to = orderedModules[index + 1]
+    if (!from || !to || from === to) {
+      continue
+    }
+    dependencies.push({
+      from,
+      to,
+      reason: isEn ? 'Fallback inferred flow' : '基于模块顺序的回退链路',
+    })
+  }
+
+  const criticalFlows = input.modules
+    .flatMap((item) => item.keyFlows.map((flow) => ({
+      name: flow.slice(0, 60),
+      steps: [item.name, flow],
+    })))
+    .slice(0, 8)
+
+  return {
+    layers,
+    dependencies,
+    criticalFlows,
+    entryModules: layers[0]?.modules ?? moduleNames.slice(0, 2),
+  }
+}
+
+async function inferArchitectureTopology(input: {
+  model: string
+  language: 'zh' | 'en' | string | undefined
+  repositoryPath: string
+  modules: SemanticTaskResult[]
+}): Promise<ArchitectureTopology> {
+  const fallback = buildFallbackArchitectureTopology({
+    language: input.language,
+    modules: input.modules,
+  })
+  if (input.modules.length === 0) {
+    return fallback
+  }
+
+  const moduleDigest = input.modules
+    .slice(0, 20)
+    .map((item) => ({
+      name: item.name,
+      summary: item.summary,
+      keyFlows: item.keyFlows.slice(0, 6),
+      risks: item.risks.slice(0, 4),
+      evidence: item.evidence.slice(0, 6),
+    }))
+
+  const langInstruction = input.language === 'en'
+    ? 'Respond in English.'
+    : '请用中文输出。'
+
+  const userMessage = [
+    '你是系统架构师。请基于模块证据推导分层关系并输出 JSON。',
+    langInstruction,
+    '只输出 JSON，schema:',
+    [
+      '{',
+      '  "layers": [{ "name": string, "modules": string[] }],',
+      '  "dependencies": [{ "from": string, "to": string, "reason": string }],',
+      '  "criticalFlows": [{ "name": string, "steps": string[] }],',
+      '  "entryModules": string[]',
+      '}',
+    ].join('\n'),
+    '规则：',
+    '- modules/dependencies 中的模块名称必须来自输入模块列表；',
+    '- dependencies 要体现真实调用/依赖关系，避免全是 Repo->Module 的扁平结构；',
+    '- criticalFlows 每条至少 2 步，优先体现跨模块链路；',
+    '- 如果证据不足请减少结论数量，不要编造。',
+    '',
+    `仓库路径：${input.repositoryPath}`,
+    '模块证据：',
+    '```json',
+    JSON.stringify(moduleDigest, null, 2),
+    '```',
+  ].join('\n')
+
+  const raw = await invokeModelToText({
+    model: input.model,
+    userMessage,
+  })
+
+  const parsed = extractJsonObjectFromText<{
+    layers?: Array<{ name?: string; modules?: string[] }>
+    dependencies?: Array<{ from?: string; to?: string; reason?: string }>
+    criticalFlows?: Array<{ name?: string; steps?: string[] }>
+    entryModules?: string[]
+  }>(raw)
+
+  if (!parsed) {
+    return fallback
+  }
+
+  const availableNames = new Set(input.modules.map((item) => item.name))
+  const sanitizeNameList = (list: string[] | undefined): string[] => {
+    if (!Array.isArray(list)) {
+      return []
+    }
+    return dedupeStrings(list).filter((item) => availableNames.has(item))
+  }
+
+  const layers = Array.isArray(parsed.layers)
+    ? parsed.layers
+      .map((item) => ({
+        name: typeof item?.name === 'string' && item.name.trim().length > 0
+          ? item.name.trim()
+          : input.language === 'en'
+            ? 'Uncategorized'
+            : '未分类层',
+        modules: sanitizeNameList(item?.modules),
+      }))
+      .filter((item) => item.modules.length > 0)
+    : []
+
+  const dependencies = Array.isArray(parsed.dependencies)
+    ? parsed.dependencies
+      .map((item) => ({
+        from: typeof item?.from === 'string' ? item.from.trim() : '',
+        to: typeof item?.to === 'string' ? item.to.trim() : '',
+        reason: typeof item?.reason === 'string' && item.reason.trim().length > 0
+          ? item.reason.trim()
+          : input.language === 'en'
+            ? 'Dependency inferred from semantic evidence'
+            : '由语义证据推导的依赖关系',
+      }))
+      .filter((item) => item.from.length > 0 && item.to.length > 0 && item.from !== item.to)
+      .filter((item) => availableNames.has(item.from) && availableNames.has(item.to))
+      .slice(0, 30)
+    : []
+
+  const criticalFlows = Array.isArray(parsed.criticalFlows)
+    ? parsed.criticalFlows
+      .map((item) => ({
+        name: typeof item?.name === 'string' && item.name.trim().length > 0
+          ? item.name.trim()
+          : input.language === 'en'
+            ? 'Unnamed flow'
+            : '未命名链路',
+        steps: sanitizeNameList(item?.steps).slice(0, 8),
+      }))
+      .filter((item) => item.steps.length >= 2)
+      .slice(0, 12)
+    : []
+
+  const entryModules = sanitizeNameList(parsed.entryModules)
+  const topology: ArchitectureTopology = {
+    layers: layers.length > 0 ? layers : fallback.layers,
+    dependencies: dependencies.length > 0 ? dependencies : fallback.dependencies,
+    criticalFlows: criticalFlows.length > 0 ? criticalFlows : fallback.criticalFlows,
+    entryModules: entryModules.length > 0 ? entryModules : fallback.entryModules,
+  }
+
+  return topology
+}
+
 function renderWikiPages(input: {
   repositoryPath: string
   metadata: PluginAiIndexMetadata
@@ -1511,6 +1945,7 @@ function renderWikiPages(input: {
   classification: CoreFileClassification
   semanticResults: SemanticTaskResult[]
   topLevelEntries: Array<{ name: string; type: 'dir' | 'file' }>
+  topology: ArchitectureTopology
 }): WikiPageArtifact[] {
   const isEn = input.metadata.language === 'en'
   const coreModules = input.semanticResults
@@ -1526,6 +1961,8 @@ function renderWikiPages(input: {
     .flatMap((item) => item.evidence)
     .filter((value, index, arr) => arr.indexOf(value) === index)
     .slice(0, 80)
+  const moduleNameToSummary = new Map(coreModules.map((item) => [item.name, item.summary]))
+  const moduleNameToEvidence = new Map(coreModules.map((item) => [item.name, item.evidence]))
 
   const pageIndexContent = [
     `# ${isEn ? 'Repository Wiki' : '仓库 Wiki'}`,
@@ -1550,23 +1987,108 @@ function renderWikiPages(input: {
       : ['- (empty)']),
   ].join('\n')
 
-  const graphNodes = coreModules.slice(0, 10)
+  const allLayerModules = input.topology.layers
+    .flatMap((layer) => layer.modules)
+    .filter((name, index, arr) => arr.indexOf(name) === index)
+  const graphModules = allLayerModules.length > 0
+    ? allLayerModules
+    : coreModules.slice(0, 10).map((item) => item.name)
+  const mermaidNodeIds = new Map(
+    graphModules.map((moduleName, index) => [moduleName, `M${index}`]),
+  )
+  const architectureGraphLines: string[] = [
+    '```mermaid',
+    'graph LR',
+    `Repo["${basename(input.repositoryPath)}"]`,
+  ]
+
+  input.topology.layers.forEach((layer, layerIndex) => {
+    architectureGraphLines.push(`subgraph L${layerIndex}["${layer.name}"]`)
+    for (const moduleName of layer.modules) {
+      const nodeId = mermaidNodeIds.get(moduleName)
+      if (!nodeId) {
+        continue
+      }
+      architectureGraphLines.push(`${nodeId}["${moduleName}"]`)
+    }
+    architectureGraphLines.push('end')
+  })
+
+  for (const entryModule of input.topology.entryModules) {
+    const nodeId = mermaidNodeIds.get(entryModule)
+    if (!nodeId) {
+      continue
+    }
+    architectureGraphLines.push(`Repo --> ${nodeId}`)
+  }
+
+  const addedDependencyKeys = new Set<string>()
+  for (const dependency of input.topology.dependencies) {
+    const fromNodeId = mermaidNodeIds.get(dependency.from)
+    const toNodeId = mermaidNodeIds.get(dependency.to)
+    if (!fromNodeId || !toNodeId || fromNodeId === toNodeId) {
+      continue
+    }
+    const key = `${fromNodeId}->${toNodeId}`
+    if (addedDependencyKeys.has(key)) {
+      continue
+    }
+    addedDependencyKeys.add(key)
+    architectureGraphLines.push(`${fromNodeId} --> ${toNodeId}`)
+  }
+
+  if (addedDependencyKeys.size === 0) {
+    const fallbackChain = graphModules.slice(0, 8)
+    for (let index = 0; index < fallbackChain.length - 1; index += 1) {
+      const fromNodeId = mermaidNodeIds.get(fallbackChain[index] ?? '')
+      const toNodeId = mermaidNodeIds.get(fallbackChain[index + 1] ?? '')
+      if (!fromNodeId || !toNodeId) {
+        continue
+      }
+      architectureGraphLines.push(`${fromNodeId} --> ${toNodeId}`)
+    }
+  }
+
+  architectureGraphLines.push('```')
+
+  const moduleDetails = graphModules.length > 0
+    ? graphModules.map((moduleName) => {
+      const summary = moduleNameToSummary.get(moduleName) ?? (isEn ? 'No semantic summary.' : '暂无语义摘要。')
+      const evidenceFiles = moduleNameToEvidence.get(moduleName) ?? []
+      const upstream = input.topology.dependencies
+        .filter((item) => item.to === moduleName)
+        .map((item) => item.from)
+      const downstream = input.topology.dependencies
+        .filter((item) => item.from === moduleName)
+        .map((item) => item.to)
+      return [
+        `### ${moduleName}`,
+        `- ${summary}`,
+        `- ${isEn ? 'Upstream' : '上游依赖'}: ${upstream.length > 0 ? upstream.join(' / ') : '-'}`,
+        `- ${isEn ? 'Downstream' : '下游依赖'}: ${downstream.length > 0 ? downstream.join(' / ') : '-'}`,
+        evidenceFiles.length > 0
+          ? `- ${isEn ? 'Evidence' : '证据'}: ${evidenceFiles.join(' / ')}`
+          : `- ${isEn ? 'Evidence' : '证据'}: -`,
+      ].join('\n')
+    })
+    : ['- (none)']
+
   const architectureContent = [
     `# ${isEn ? 'Architecture' : '架构总览'}`,
     '',
-    '```mermaid',
-    'graph TD',
-    `Repo["${basename(input.repositoryPath)}"]`,
-    ...graphNodes.map((module, index) => `Repo --> M${index}["${module.name}"]`),
-    '```',
+    ...architectureGraphLines,
+    '',
+    `## ${isEn ? 'Layered Modules' : '分层模块说明'}`,
+    ...(input.topology.layers.length > 0
+      ? input.topology.layers.map((layer) => `- ${layer.name}: ${layer.modules.join(' / ')}`)
+      : ['- (none)']),
     '',
     `## ${isEn ? 'Core Modules' : '核心模块'}`,
-    ...(coreModules.length > 0
-      ? coreModules.map((module) => [
-        `### ${module.name}`,
-        `- ${module.summary}`,
-        module.evidence.length > 0 ? `- 证据: ${module.evidence.join(' / ')}` : '- 证据: -',
-      ].join('\n'))
+    ...moduleDetails,
+    '',
+    `## ${isEn ? 'Dependency Rationale' : '关键依赖关系说明'}`,
+    ...(input.topology.dependencies.length > 0
+      ? input.topology.dependencies.slice(0, 20).map((item) => `- ${item.from} -> ${item.to}: ${item.reason}`)
       : ['- (none)']),
   ].join('\n')
 
@@ -1575,6 +2097,11 @@ function renderWikiPages(input: {
     '',
     `## ${isEn ? 'Key Execution Flows' : '关键执行流'}`,
     ...(keyFlows.length > 0 ? keyFlows.map((flow) => `- ${flow}`) : ['- (none)']),
+    '',
+    `## ${isEn ? 'Cross-module Semantic Flows' : '跨模块语义链路'}`,
+    ...(input.topology.criticalFlows.length > 0
+      ? input.topology.criticalFlows.map((flow) => `- ${flow.name}: ${flow.steps.join(' -> ')}`)
+      : ['- (none)']),
     '',
     `## ${isEn ? 'Configuration Signals' : '配置与构建信号'}`,
     ...input.manifest
@@ -1877,11 +2404,18 @@ async function computeScanResult(input: {
   }
 
   input.reportProgress('classify', 48, '正在识别核心文件与模块...')
+  const contentClues = buildFileContentClues({
+    textFiles,
+    keyFiles: keyFileInsights,
+  })
   const classification = await classifyRepositoryFiles({
     model: input.model,
     language: input.language,
     repositoryPath: input.repositoryPath,
     manifest,
+    contentClues,
+    dependencySignals: [...dependencySignals],
+    commandSignals: [...commandSignals],
   })
 
   const semanticTasks = buildSemanticTasks({
@@ -1910,6 +2444,23 @@ async function computeScanResult(input: {
     throw new Error('语义分析失败：未产出有效结果')
   }
 
+  input.reportProgress('semantic', 83, '正在推导模块分层与依赖拓扑...')
+  let topology: ArchitectureTopology
+  try {
+    topology = await inferArchitectureTopology({
+      model: input.model,
+      language: input.language,
+      repositoryPath: input.repositoryPath,
+      modules: semanticResults.filter((item) => item.type === 'module'),
+    })
+  } catch (error) {
+    console.warn('[插件索引] 模块拓扑推导失败，回退到启发式结构:', error)
+    topology = buildFallbackArchitectureTopology({
+      language: input.language,
+      modules: semanticResults.filter((item) => item.type === 'module'),
+    })
+  }
+
   input.reportProgress('synthesize', 86, '正在合成多页 Wiki...')
   let pages = renderWikiPages({
     repositoryPath: input.repositoryPath,
@@ -1918,6 +2469,7 @@ async function computeScanResult(input: {
     classification,
     semanticResults,
     topLevelEntries,
+    topology,
   })
 
   input.reportProgress('synthesize', 92, '主 Agent 正在润色文档...')
@@ -1957,6 +2509,8 @@ async function persistKnowledgeBase(input: {
   const kbRoot = getKnowledgeBaseRoot(input.workspacePath, input.knowledgeBaseId)
   const metadataPath = getKnowledgeBaseMetadataPath(input.workspacePath, input.knowledgeBaseId)
   const chunksPath = getKnowledgeBaseChunksPath(input.workspacePath, input.knowledgeBaseId)
+  const kbMarkdownPath = getKnowledgeBaseMarkdownPath(input.workspacePath, input.knowledgeBaseId)
+  const kbPagesRoot = getKnowledgeBasePagesRoot(input.workspacePath, input.knowledgeBaseId)
   const latestMarkdownPath = getLatestMarkdownPath(input.workspacePath)
   const latestJsonPath = getLatestJsonPath(input.workspacePath)
   const latestSummaryPath = getLatestIndexSummaryPath(input.workspacePath)
@@ -1966,12 +2520,22 @@ async function persistKnowledgeBase(input: {
   await mkdir(kbRoot, { recursive: true })
   await writeJsonFile(metadataPath, input.metadata)
   await writeJsonFile(chunksPath, input.chunks)
+  await mkdir(dirname(kbMarkdownPath), { recursive: true })
+  await writeFile(kbMarkdownPath, `${input.markdown}\n`, 'utf-8')
+  await mkdir(kbPagesRoot, { recursive: true })
 
   await mkdir(dirname(latestMarkdownPath), { recursive: true })
   await writeFile(latestMarkdownPath, `${input.markdown}\n`, 'utf-8')
   await mkdir(wikiPagesRoot, { recursive: true })
 
   for (const page of input.pages) {
+    const knowledgeBasePagePath = getKnowledgeBasePagePath(
+      input.workspacePath,
+      input.knowledgeBaseId,
+      page.id,
+    )
+    await writeFile(knowledgeBasePagePath, `${page.content}\n`, 'utf-8')
+
     const pagePath = getWikiPagePath(input.workspacePath, page.id)
     await writeFile(pagePath, `${page.content}\n`, 'utf-8')
   }
@@ -1980,12 +2544,15 @@ async function persistKnowledgeBase(input: {
     knowledgeBaseId: input.knowledgeBaseId,
     metadata: input.metadata,
     indexPath: chunksPath,
-    markdownPath: latestMarkdownPath,
+    markdownPath: normalizeRelPath(relative(input.workspacePath, kbMarkdownPath)),
     generationMode: 'multi-page',
     pages: input.pages.map((page) => ({
       id: page.id,
       title: page.title,
-      path: page.path,
+      path: normalizeRelPath(relative(
+        input.workspacePath,
+        getKnowledgeBasePagePath(input.workspacePath, input.knowledgeBaseId, page.id),
+      )),
     })),
   }
 
@@ -2010,7 +2577,10 @@ async function persistKnowledgeBase(input: {
     pages: input.pages.map((page) => ({
       id: page.id,
       title: page.title,
-      path: page.path,
+      path: normalizeRelPath(relative(
+        input.workspacePath,
+        getKnowledgeBasePagePath(input.workspacePath, input.knowledgeBaseId, page.id),
+      )),
     })),
     indexSummary: {
       knowledgeBaseId: input.knowledgeBaseId,
@@ -2092,14 +2662,34 @@ export async function getLatestIndexSummary(
       knowledgeBaseId: kbId,
       metadata,
       indexPath: getKnowledgeBaseChunksPath(workspacePath, kbId),
-      markdownPath: getLatestMarkdownPath(workspacePath),
+      markdownPath: normalizeRelPath(relative(workspacePath, getKnowledgeBaseMarkdownPath(workspacePath, kbId))),
       generationMode: 'multi-page',
       pages: [
-        { id: 'index', title: metadata.language === 'en' ? 'Index' : '首页', path: 'wiki/pages/index.md' },
-        { id: 'architecture', title: metadata.language === 'en' ? 'Architecture' : '架构总览', path: 'wiki/pages/architecture.md' },
-        { id: 'runtime', title: metadata.language === 'en' ? 'Runtime' : '运行链路', path: 'wiki/pages/runtime.md' },
-        { id: 'modules', title: metadata.language === 'en' ? 'Modules' : '模块明细', path: 'wiki/pages/modules.md' },
-        { id: 'data-risks', title: metadata.language === 'en' ? 'Data & Risks' : '数据与风险', path: 'wiki/pages/data-risks.md' },
+        {
+          id: 'index',
+          title: metadata.language === 'en' ? 'Index' : '首页',
+          path: normalizeRelPath(relative(workspacePath, getKnowledgeBasePagePath(workspacePath, kbId, 'index'))),
+        },
+        {
+          id: 'architecture',
+          title: metadata.language === 'en' ? 'Architecture' : '架构总览',
+          path: normalizeRelPath(relative(workspacePath, getKnowledgeBasePagePath(workspacePath, kbId, 'architecture'))),
+        },
+        {
+          id: 'runtime',
+          title: metadata.language === 'en' ? 'Runtime' : '运行链路',
+          path: normalizeRelPath(relative(workspacePath, getKnowledgeBasePagePath(workspacePath, kbId, 'runtime'))),
+        },
+        {
+          id: 'modules',
+          title: metadata.language === 'en' ? 'Modules' : '模块明细',
+          path: normalizeRelPath(relative(workspacePath, getKnowledgeBasePagePath(workspacePath, kbId, 'modules'))),
+        },
+        {
+          id: 'data-risks',
+          title: metadata.language === 'en' ? 'Data & Risks' : '数据与风险',
+          path: normalizeRelPath(relative(workspacePath, getKnowledgeBasePagePath(workspacePath, kbId, 'data-risks'))),
+        },
       ],
     }
   }
@@ -2116,7 +2706,10 @@ export async function startAiIndexingTask(input: {
   pluginId: string
   workspacePath: string
   payload: Omit<PluginStartAiIndexingTaskInput, 'pluginId'>
+  taskId?: string
 }): Promise<PluginTaskOperationResult> {
+  bindTaskPersistenceListener()
+
   const repositoryPath = resolve(input.payload.repositoryPath)
   const knowledgeBaseId = sanitizeKnowledgeBaseId(
     input.payload.knowledgeBaseId?.trim() || basename(repositoryPath),
@@ -2126,9 +2719,26 @@ export async function startAiIndexingTask(input: {
   const scanMode = normalizeScanMode(input.payload.scanMode)
   const subagentCount = normalizeSubagentCount(input.payload.subagentCount)
   const maxFileBytesForFullAnalyze = normalizeMaxFileBytes(input.payload.maxFileBytesForFullAnalyze)
+  const taskId = input.taskId?.trim() || randomUUID()
 
-  return pluginTaskRuntime.startTask(
+  await createWikiTaskRecord({
+    taskId,
+    pluginId: input.pluginId,
+    taskType: 'ai-indexing-scan',
+    repositoryPath,
+    knowledgeBaseId,
+    workspacePath: input.workspacePath,
+    model,
+    language: input.payload.language,
+    analysisDepth: input.payload.analysisDepth,
+    scanMode,
+    subagentCount,
+    maxFileBytesForFullAnalyze,
+  })
+
+  const startResult = pluginTaskRuntime.startTask(
     {
+      taskId,
       pluginId: input.pluginId,
       taskType: 'ai-indexing-scan',
       metadata: {
@@ -2190,6 +2800,13 @@ export async function startAiIndexingTask(input: {
         rebuiltFiles: result.rebuiltFiles,
       })
 
+      await persistWikiTaskArtifacts({
+        taskId: taskContext.taskId,
+        markdown: result.markdown,
+        pages: result.pages,
+        summary,
+      })
+
       taskContext.reportProgress({
         stage: 'done',
         percent: 100,
@@ -2202,4 +2819,115 @@ export async function startAiIndexingTask(input: {
       }
     },
   )
+
+  if (!startResult.success) {
+    await updateWikiTaskRecord(taskId, {
+      state: 'failed',
+      error: startResult.error ?? '任务启动失败',
+      completedAt: nowIso(),
+    })
+    return startResult
+  }
+
+  return startResult
+}
+
+export async function recoverAiIndexingTasks(input: {
+  pluginId: string
+  workspacePath: string
+}): Promise<void> {
+  if (input.pluginId !== WIKI_LOCAL_REPOSITORY_PLUGIN_ID) {
+    return
+  }
+
+  bindTaskPersistenceListener()
+
+  const recoverableTasks = await listRecoverableWikiTasks(input.pluginId)
+  if (recoverableTasks.length === 0) {
+    return
+  }
+
+  for (const task of recoverableTasks) {
+    const existed = pluginTaskRuntime.getTaskForPlugin(input.pluginId, task.taskId)
+    if (existed) {
+      continue
+    }
+
+    console.log(`[插件索引] 检测到可恢复任务，开始续跑: taskId=${task.taskId}`)
+    await updateWikiTaskRecord(task.taskId, {
+      state: 'running',
+      error: undefined,
+    })
+
+    const recovered = await startAiIndexingTask({
+      pluginId: input.pluginId,
+      workspacePath: input.workspacePath,
+      taskId: task.taskId,
+      payload: {
+        repositoryPath: task.repositoryPath,
+        knowledgeBaseId: task.knowledgeBaseId,
+        model: task.model,
+        language: task.language,
+        analysisDepth: task.analysisDepth,
+        scanMode: task.scanMode,
+        subagentCount: task.subagentCount,
+        maxFileBytesForFullAnalyze: task.maxFileBytesForFullAnalyze,
+      },
+    })
+
+    if (!recovered.success) {
+      await updateWikiTaskRecord(task.taskId, {
+        state: 'failed',
+        error: recovered.error ?? '任务恢复失败',
+        completedAt: nowIso(),
+      })
+      console.warn(`[插件索引] 任务恢复失败: taskId=${task.taskId}, error=${recovered.error ?? 'unknown'}`)
+    }
+  }
+}
+
+export async function getPersistedTaskSnapshot(
+  pluginId: string,
+  taskId: string,
+): Promise<PluginTaskSnapshot | null> {
+  const records = await listRecoverableWikiTasks(pluginId)
+  const record = records.find((item) => item.taskId === taskId)
+  if (!record) {
+    return null
+  }
+
+  return {
+    taskId: record.taskId,
+    pluginId: record.pluginId,
+    taskType: record.taskType,
+    state: record.state,
+    progress: record.progress,
+    metadata: {
+      repositoryPath: record.repositoryPath,
+      knowledgeBaseId: record.knowledgeBaseId,
+      model: record.model,
+      language: record.language,
+      analysisDepth: record.analysisDepth,
+      scanMode: record.scanMode,
+      subagentCount: record.subagentCount,
+      maxFileBytesForFullAnalyze: record.maxFileBytesForFullAnalyze,
+    },
+    result: record.result,
+    error: record.error,
+    startedAt: record.startedAt ?? record.createdAt,
+    updatedAt: record.updatedAt,
+    completedAt: record.completedAt,
+  }
+}
+
+export async function markPersistedTaskState(input: {
+  taskId: string
+  state: PluginTaskSnapshot['state']
+  error?: string
+}): Promise<void> {
+  await updateWikiTaskRecord(input.taskId, {
+    state: input.state,
+    error: input.error,
+    completedAt: input.state === 'failed' || input.state === 'stopped' ? nowIso() : undefined,
+  })
 }

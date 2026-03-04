@@ -210,12 +210,6 @@ describe('wiki-local-repository-plugin workbench flow', () => {
     })
     expect(resume.success).toBe(true)
 
-    const latest = await pluginModule.invokeWorkbenchAction({
-      actionId: 'get-latest',
-      payload: {},
-    })
-    expect(latest.success).toBe(true)
-
     const canvasResult = await pluginModule.getWorkbenchCanvas()
     expect(canvasResult.success).toBe(true)
     if (!canvasResult.success || !canvasResult.data || canvasResult.data.root.type !== 'page') {
@@ -242,6 +236,8 @@ describe('wiki-local-repository-plugin workbench flow', () => {
       if (markdownNode && markdownNode.type === 'markdown') {
         expect((markdownNode.pages ?? []).length).toBeGreaterThan(0)
         expect(markdownNode.tocScope).toBe('global')
+        expect((markdownNode.repositoryList ?? []).length).toBeGreaterThan(0)
+        expect(markdownNode.activeRepositoryId).toBe(repoPath)
       }
     }
   })

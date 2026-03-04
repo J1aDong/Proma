@@ -25,6 +25,7 @@ interface TaskRecord {
 export interface StartPluginTaskInput {
   pluginId: string
   taskType: string
+  taskId?: string
   metadata?: Record<string, unknown>
 }
 
@@ -61,7 +62,13 @@ export class PluginTaskRuntime {
   }
 
   startTask(input: StartPluginTaskInput, executor: PluginTaskExecutor): PluginTaskOperationResult {
-    const taskId = randomUUID()
+    const taskId = input.taskId?.trim() || randomUUID()
+    if (this.taskMap.has(taskId)) {
+      return {
+        success: false,
+        error: `任务已存在: ${taskId}`,
+      }
+    }
     const timestamp = nowIso()
 
     const snapshot: PluginTaskSnapshot = {

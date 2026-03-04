@@ -70,6 +70,31 @@ export function PluginWorkbenchView(): React.ReactElement {
     }
   }, [loadCanvas, selectedItem, canvas, canvasLoading, canvasError])
 
+  React.useEffect(() => {
+    if (!selectedItem || selectedItem.state !== 'active' || !selectedItem.hasCanvasHook) {
+      return
+    }
+
+    const dispose = window.electronAPI.onPluginTaskEvent((event) => {
+      if (event.task.pluginId !== selectedItem.pluginId) {
+        return
+      }
+
+      if (event.type !== 'completed' && event.type !== 'failed' && event.type !== 'stopped') {
+        return
+      }
+
+      void loadCanvas({
+        pluginId: selectedItem.pluginId,
+        reason: 'refresh',
+      })
+    })
+
+    return () => {
+      dispose()
+    }
+  }, [loadCanvas, selectedItem])
+
   const handleReloadCanvas = React.useCallback(() => {
     if (!selectedItem) return
     void loadCanvas({ pluginId: selectedItem.pluginId, reason: 'refresh' })

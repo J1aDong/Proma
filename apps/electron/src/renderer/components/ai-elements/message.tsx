@@ -203,6 +203,25 @@ interface MessageResponseProps {
   headingIdPrefix?: string
 }
 
+export function buildMarkdownHeadingAnchorId(
+  rawText: string,
+  headingIdMap: Map<string, number>,
+  headingIdPrefix?: string,
+): string {
+  const base = rawText
+    .trim()
+    .toLowerCase()
+    .replace(/[!"#$%&'()*+,./:;<=>?@[\\\]^`{|}~]/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+  const normalizedBase = base || 'section'
+  const used = headingIdMap.get(normalizedBase) ?? 0
+  headingIdMap.set(normalizedBase, used + 1)
+  const suffix = used > 0 ? `-${used}` : ''
+  const withDup = `${normalizedBase}${suffix}`
+  return headingIdPrefix ? `${headingIdPrefix}-${withDup}` : withDup
+}
+
 /** 使用 react-markdown 渲染 assistant 消息内容，代码块使用 Shiki 语法高亮 */
 export const MessageResponse = React.memo(
   function MessageResponse({ children, className, headingIdPrefix }: MessageResponseProps): React.ReactElement {
@@ -217,21 +236,11 @@ export const MessageResponse = React.memo(
       return ''
     }, [])
 
-    const headingIdMap = React.useMemo(() => new Map<string, number>(), [children, headingIdPrefix])
-    const buildHeadingId = React.useCallback((rawText: string): string => {
-      const base = rawText
-        .trim()
-        .toLowerCase()
-        .replace(/[!"#$%&'()*+,./:;<=>?@[\\\]^`{|}~]/g, '')
-        .replace(/\s+/g, '-')
-        .replace(/-+/g, '-')
-      const normalizedBase = base || 'section'
-      const used = headingIdMap.get(normalizedBase) ?? 0
-      headingIdMap.set(normalizedBase, used + 1)
-      const suffix = used > 0 ? `-${used}` : ''
-      const withDup = `${normalizedBase}${suffix}`
-      return headingIdPrefix ? `${headingIdPrefix}-${withDup}` : withDup
-    }, [headingIdMap, headingIdPrefix])
+    // 这里必须在每次 render 时重建，避免 StrictMode 双渲染把计数累加到 -1/-2。
+    const headingIdMap = new Map<string, number>()
+    const buildHeadingId = (rawText: string): string => {
+      return buildMarkdownHeadingAnchorId(rawText, headingIdMap, headingIdPrefix)
+    }
 
     const renderHeading = React.useCallback((
       level: 1 | 2 | 3 | 4 | 5 | 6,
