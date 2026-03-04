@@ -1,6 +1,16 @@
 import { app, BrowserWindow, Menu, screen, shell } from 'electron'
 import { join } from 'path'
 import { existsSync } from 'fs'
+
+// 清理本地环境中的 ANTHROPIC_* 变量，防止干扰应用的认证流程
+// Electron 桌面应用通过渠道系统管理 API Key，不应受终端环境变量影响
+// 注意：此操作必须在 initializeRuntime()（loadShellEnv）之前执行
+for (const key of Object.keys(process.env)) {
+  if (key.startsWith('ANTHROPIC_')) {
+    delete process.env[key]
+  }
+}
+
 import { createApplicationMenu } from './menu'
 import { registerIpcHandlers } from './ipc'
 import { createTray, destroyTray } from './tray'
@@ -11,6 +21,7 @@ import { stopAllAgents } from './lib/agent-service'
 import { stopAllGenerations } from './lib/chat-service'
 import { initAutoUpdater, cleanupUpdater } from './lib/updater/auto-updater'
 import { startWorkspaceWatcher, stopWorkspaceWatcher } from './lib/workspace-watcher'
+import { startChatToolsWatcher, stopChatToolsWatcher } from './lib/chat-tools-watcher'
 import { getIsQuitting, setQuitting, isUpdating } from './lib/app-lifecycle'
 
 let mainWindow: BrowserWindow | null = null
@@ -222,6 +233,9 @@ app.whenReady().then(async () => {
     startWorkspaceWatcher(mainWindow)
   }
 
+  // 启动 Chat 工具配置文件监听（Agent 创建工具后自动通知渲染进程）
+  startChatToolsWatcher()
+
   // 生产环境下初始化自动更新
   if (app.isPackaged && mainWindow) {
     initAutoUpdater(mainWindow)
@@ -263,6 +277,8 @@ app.on('before-quit', () => {
   cleanupUpdater()
   // 停止工作区文件监听
   stopWorkspaceWatcher()
+  // 停止 Chat 工具配置文件监听
+  stopChatToolsWatcher()
   // Clean up system tray before quitting
   destroyTray()
 })

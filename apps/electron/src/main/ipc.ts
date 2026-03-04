@@ -16,6 +16,7 @@ import {
   GITHUB_RELEASE_IPC_CHANNELS,
   SYSTEM_PROMPT_IPC_CHANNELS,
   MEMORY_IPC_CHANNELS,
+  CHAT_TOOL_IPC_CHANNELS,
 } from '@proma/shared'
 import { USER_PROFILE_IPC_CHANNELS, SETTINGS_IPC_CHANNELS } from '../types'
 import type {
@@ -90,6 +91,9 @@ import type {
   SystemPromptCreateInput,
   SystemPromptUpdateInput,
   MemoryConfig,
+  ChatToolInfo,
+  ChatToolState,
+  ChatToolMeta,
 } from '@proma/shared'
 import type { UserProfile, AppSettings } from '../types'
 import { getRuntimeStatus, getGitRepoStatus } from './lib/runtime-init'
@@ -134,11 +138,12 @@ import {
   getAgentSessionMessages,
   updateAgentSessionMeta,
   deleteAgentSession,
+  migrateChatToAgentSession,
 } from './lib/agent-session-manager'
 import { runAgent, stopAgent, generateAgentTitle, saveFilesToAgentSession, copyFolderToSession } from './lib/agent-service'
 import { permissionService } from './lib/agent-permission-service'
 import { askUserService } from './lib/agent-ask-user-service'
-import { getAgentSessionWorkspacePath, getAgentWorkspacesDir } from './lib/config-paths'
+import { getAgentSessionWorkspacePath, getAgentWorkspacesDir, getWorkspaceSkillsDir } from './lib/config-paths'
 import {
   listAgentWorkspaces,
   createAgentWorkspace,
@@ -147,14 +152,17 @@ import {
   ensureDefaultWorkspace,
   getWorkspaceMcpConfig,
   saveWorkspaceMcpConfig,
-  getWorkspaceSkills,
+  getAllWorkspaceSkills,
   getWorkspaceCapabilities,
   getAgentWorkspace,
   deleteWorkspaceSkill,
+  toggleWorkspaceSkill,
   getWorkspacePermissionMode,
   setWorkspacePermissionMode,
 } from './lib/agent-workspace-manager'
 import { getMemoryConfig, setMemoryConfig } from './lib/memory-service'
+import { getAllToolInfos } from './lib/chat-tool-registry'
+import { updateToolState, updateToolCredentials, getToolCredentials, addCustomTool, deleteCustomTool } from './lib/chat-tool-config'
 import {
   getSystemPromptConfig,
   createSystemPrompt,
@@ -819,6 +827,25 @@ export function registerIpcHandlers(): void {
     }
   )
 
+  // 迁移 Chat 对话记录到 Agent 会话
+  ipcMain.handle(
+    AGENT_IPC_CHANNELS.MIGRATE_CHAT_TO_AGENT,
+    async (_, conversationId: string, agentSessionId: string): Promise<void> => {
+      migrateChatToAgentSession(conversationId, agentSessionId)
+    }
+  )
+
+  // 切换 Agent 会话置顶状态
+  ipcMain.handle(
+    AGENT_IPC_CHANNELS.TOGGLE_PIN,
+    async (_, id: string): Promise<AgentSessionMeta> => {
+      const sessions = listAgentSessions()
+      const current = sessions.find((s) => s.id === id)
+      if (!current) throw new Error(`Agent 会话不存在: ${id}`)
+      return updateAgentSessionMeta(id, { pinned: !current.pinned })
+    }
+  )
+
   // ===== Agent 工作区管理相关 =====
 
   // 确保默认工作区存在
@@ -895,11 +922,19 @@ export function registerIpcHandlers(): void {
     }
   )
 
-  // 获取工作区 Skill 列表
+  // 获取工作区 Skill 列表（含活跃和不活跃，设置页 UI 用）
   ipcMain.handle(
     AGENT_IPC_CHANNELS.GET_SKILLS,
     async (_, workspaceSlug: string): Promise<SkillMeta[]> => {
-      return getWorkspaceSkills(workspaceSlug)
+      return getAllWorkspaceSkills(workspaceSlug)
+    }
+  )
+
+  // 获取工作区 Skills 目录绝对路径
+  ipcMain.handle(
+    AGENT_IPC_CHANNELS.GET_SKILLS_DIR,
+    async (_, workspaceSlug: string): Promise<string> => {
+      return getWorkspaceSkillsDir(workspaceSlug)
     }
   )
 
@@ -908,6 +943,14 @@ export function registerIpcHandlers(): void {
     AGENT_IPC_CHANNELS.DELETE_SKILL,
     async (_, workspaceSlug: string, skillSlug: string): Promise<void> => {
       return deleteWorkspaceSkill(workspaceSlug, skillSlug)
+    }
+  )
+
+  // 切换工作区 Skill 启用/禁用
+  ipcMain.handle(
+    AGENT_IPC_CHANNELS.TOGGLE_SKILL,
+    async (_, workspaceSlug: string, skillSlug: string, enabled: boolean): Promise<void> => {
+      return toggleWorkspaceSkill(workspaceSlug, skillSlug, enabled)
     }
   )
 
@@ -1037,6 +1080,111 @@ export function registerIpcHandlers(): void {
         const msg = error instanceof Error ? error.message : String(error)
         return { success: false, message: `连接失败: ${msg}` }
       }
+    }
+  )
+
+  // ===== Chat 工具管理 =====
+
+  // 获取所有工具信息
+  ipcMain.handle(
+    CHAT_TOOL_IPC_CHANNELS.GET_ALL_TOOLS,
+    async (): Promise<ChatToolInfo[]> => {
+      return getAllToolInfos()
+    }
+  )
+
+  // 获取工具凭据
+  ipcMain.handle(
+    CHAT_TOOL_IPC_CHANNELS.GET_TOOL_CREDENTIALS,
+    async (_, toolId: string): Promise<Record<string, string>> => {
+      return getToolCredentials(toolId)
+    }
+  )
+
+  // 更新工具开关状态
+  ipcMain.handle(
+    CHAT_TOOL_IPC_CHANNELS.UPDATE_TOOL_STATE,
+    async (_, toolId: string, state: ChatToolState): Promise<void> => {
+      updateToolState(toolId, state)
+    }
+  )
+
+  // 更新工具凭据
+  ipcMain.handle(
+    CHAT_TOOL_IPC_CHANNELS.UPDATE_TOOL_CREDENTIALS,
+    async (_, toolId: string, credentials: Record<string, string>): Promise<void> => {
+      updateToolCredentials(toolId, credentials)
+    }
+  )
+
+  // 创建自定义工具
+  ipcMain.handle(
+    CHAT_TOOL_IPC_CHANNELS.CREATE_CUSTOM_TOOL,
+    async (_, meta: ChatToolMeta): Promise<void> => {
+      addCustomTool(meta)
+    }
+  )
+
+  // 删除自定义工具
+  ipcMain.handle(
+    CHAT_TOOL_IPC_CHANNELS.DELETE_CUSTOM_TOOL,
+    async (_, toolId: string): Promise<void> => {
+      deleteCustomTool(toolId)
+    }
+  )
+
+  // 测试工具连接
+  ipcMain.handle(
+    CHAT_TOOL_IPC_CHANNELS.TEST_TOOL,
+    async (_, toolId: string): Promise<{ success: boolean; message: string }> => {
+      // 记忆工具复用现有测试逻辑
+      if (toolId === 'memory') {
+        const config = getMemoryConfig()
+        if (!config.apiKey) {
+          return { success: false, message: '请先填写 API Key' }
+        }
+        try {
+          const { searchMemory } = await import('./lib/memos-client')
+          const result = await searchMemory(
+            { apiKey: config.apiKey, userId: config.userId?.trim() || 'proma-user', baseUrl: config.baseUrl },
+            'test connection',
+            1,
+          )
+          return { success: true, message: `连接成功，已检索到 ${result.facts.length} 条事实、${result.preferences.length} 条偏好` }
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : String(error)
+          return { success: false, message: `连接失败: ${msg}` }
+        }
+      }
+      // 联网搜索工具测试
+      if (toolId === 'web-search') {
+        const { getToolCredentials: getCredentials } = await import('./lib/chat-tool-config')
+        const credentials = getCredentials('web-search')
+        if (!credentials.apiKey) {
+          return { success: false, message: '请先填写 Tavily API Key' }
+        }
+        try {
+          const response = await fetch('https://api.tavily.com/search', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              api_key: credentials.apiKey,
+              query: 'test connection',
+              search_depth: 'basic',
+              max_results: 1,
+            }),
+          })
+          if (!response.ok) {
+            const errorText = await response.text()
+            return { success: false, message: `API 请求失败 (${response.status}): ${errorText}` }
+          }
+          return { success: true, message: '连接成功，Tavily 搜索 API 可用' }
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : String(error)
+          return { success: false, message: `连接失败: ${msg}` }
+        }
+      }
+      return { success: false, message: `工具 ${toolId} 不支持测试` }
     }
   )
 

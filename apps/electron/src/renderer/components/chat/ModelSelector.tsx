@@ -9,7 +9,7 @@
  */
 
 import * as React from 'react'
-import { useAtom, useAtomValue, useSetAtom } from 'jotai'
+import { useAtomValue, useSetAtom } from 'jotai'
 import { ChevronDown, Cpu, Search } from 'lucide-react'
 import {
   Dialog,
@@ -18,10 +18,10 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import {
-  selectedModelAtom,
-  currentConversationIdAtom,
   conversationsAtom,
 } from '@/atoms/chat-atoms'
+import { useConversationModelOptional } from '@/hooks/useConversationSettings'
+import { useConversationIdOptional } from '@/contexts/session-context'
 import { getModelLogo, getChannelLogo } from '@/lib/model-logo'
 import { cn } from '@/lib/utils'
 import type { Channel, ModelOption } from '@proma/shared'
@@ -85,35 +85,12 @@ export function ModelSelector({
   includeAutoOption = false,
   triggerClassName,
 }: ModelSelectorProps = {}): React.ReactElement {
-  const [internalSelectedModel, setInternalSelectedModel] = useAtom(selectedModelAtom)
-  const currentConversationId = useAtomValue(currentConversationIdAtom)
+  const [conversationModel, setConversationModel] = useConversationModelOptional()
+  const conversationId = useConversationIdOptional()
   const setConversations = useSetAtom(conversationsAtom)
   const [channels, setChannels] = React.useState<Channel[]>([])
   const [open, setOpen] = React.useState(false)
   const [search, setSearch] = React.useState('')
-
-  const modelOptions = React.useMemo(() => buildModelOptions(channels, filterChannelId), [channels, filterChannelId])
-
-  // 外部模型优先，否则用内部 atom
-  const selectedModel = externalSelectedModelId !== undefined
-    ? (externalSelectedModelId === '__auto__' ? { channelId: '__auto__', modelId: '__auto__' } : modelOptions.find(m => m.modelId === externalSelectedModelId))
-    : internalSelectedModel
-
-  // 构建展示选项列表，处理 __auto__ 注入
-  const displayModelOptions = React.useMemo(() => {
-    if (!includeAutoOption) return modelOptions
-
-    return [
-      {
-        channelId: '__auto__',
-        channelName: '系统推荐',
-        modelId: '__auto__',
-        modelName: '自动选择（默认）',
-        provider: 'auto' as any // Type assertion for UI rendering
-      },
-      ...modelOptions
-    ]
-  }, [modelOptions, includeAutoOption])
 
   React.useEffect(() => {
     window.electronAPI.listChannels().then(setChannels).catch(console.error)
@@ -127,9 +104,38 @@ export function ModelSelector({
     }
   }, [open])
 
+  const modelOptions = React.useMemo(() => buildModelOptions(channels, filterChannelId), [channels, filterChannelId])
+
+  const selectedModel = React.useMemo(() => {
+    if (externalSelectedModelId !== undefined) {
+      if (externalSelectedModelId === '__auto__') {
+        return { channelId: '__auto__', modelId: '__auto__' }
+      }
+      return modelOptions.find((option) => option.modelId === externalSelectedModelId) ?? null
+    }
+    return conversationModel
+  }, [externalSelectedModelId, modelOptions, conversationModel])
+
+  const displayModelOptions = React.useMemo(() => {
+    if (!includeAutoOption) {
+      return modelOptions
+    }
+    return [
+      {
+        channelId: '__auto__',
+        channelName: '系统推荐',
+        modelId: '__auto__',
+        modelName: '自动选择（默认）',
+        provider: (channels[0]?.provider ?? 'openai') as ModelOption['provider'],
+      },
+      ...modelOptions,
+    ]
+  }, [channels, modelOptions, includeAutoOption])
+
+  const groupedDisplay = React.useMemo(() => groupByChannel(displayModelOptions), [displayModelOptions])
+
   // 搜索过滤
   const filteredGrouped = React.useMemo(() => {
-    const groupedDisplay = groupByChannel(displayModelOptions)
     if (!search.trim()) return groupedDisplay
 
     const query = search.toLowerCase()
@@ -147,7 +153,7 @@ export function ModelSelector({
     }
 
     return filtered
-  }, [displayModelOptions, search])
+  }, [groupedDisplay, search])
 
   // 扁平化过滤后的模型列表，用于键盘导航
   const flatOptions = React.useMemo(() => {
@@ -190,13 +196,16 @@ export function ModelSelector({
       return
     }
 
-    setInternalSelectedModel({ channelId: option.channelId, modelId: option.modelId })
+    // Chat 模式：写入 per-conversation Map
+    if (setConversationModel) {
+      setConversationModel({ channelId: option.channelId, modelId: option.modelId })
+    }
     setOpen(false)
 
     // 将模型/渠道选择保存到当前对话元数据
-    if (currentConversationId) {
+    if (conversationId) {
       window.electronAPI
-        .updateConversationModel(currentConversationId, option.modelId, option.channelId)
+        .updateConversationModel(conversationId, option.modelId, option.channelId)
         .then((updated) => {
           setConversations((prev) =>
             prev.map((c) => (c.id === updated.id ? updated : c))

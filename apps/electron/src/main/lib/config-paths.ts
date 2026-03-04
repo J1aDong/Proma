@@ -166,6 +166,15 @@ export function getMemoryConfigPath(): string {
 }
 
 /**
+ * 获取 Chat 工具配置文件路径
+ *
+ * @returns ~/.proma/chat-tools.json
+ */
+export function getChatToolsConfigPath(): string {
+  return join(getConfigDir(), 'chat-tools.json')
+}
+
+/**
  * 获取 Agent 会话索引文件路径
  *
  * @returns ~/.proma/agent-sessions.json
@@ -383,6 +392,25 @@ export function getPluginWikiRootDir(): string {
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true })
     console.log(`[配置] 已创建 Wiki 持久化目录: ${dir}`)
+  }
+
+  return dir
+}
+
+/**
+ * 获取工作区不活跃 Skills 目录路径
+ *
+ * 禁用的 Skill 会被移动到此目录，Agent SDK 不会扫描该目录。
+ * 如果目录不存在则自动创建。
+ *
+ * @param slug 工作区 slug
+ * @returns ~/.proma/agent-workspaces/{slug}/skills-inactive/
+ */
+export function getInactiveSkillsDir(slug: string): string {
+  const dir = join(getAgentWorkspacePath(slug), 'skills-inactive')
+
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true })
   }
 
   return dir

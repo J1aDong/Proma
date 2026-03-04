@@ -27,6 +27,9 @@ export * from './agent'
 // 插件系统相关类型
 export * from './plugin'
 
+// Agent Provider 适配器接口
+export * from './agent-provider'
+
 // 环境检测相关类型
 export * from './environment'
 
@@ -35,3 +38,6 @@ export * from './github'
 
 // 系统提示词相关类型
 export * from './system-prompt'
+
+// Chat 工具（function calling）相关类型
+export * from './chat-tool'
