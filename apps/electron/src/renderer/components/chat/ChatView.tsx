@@ -139,17 +139,20 @@ function ChatViewInner({ conversationId }: ChatViewProps): React.ReactElement {
   }, [conversation?.contextDividers])
 
   // 从对话元数据恢复模型/渠道选择（写入 per-conversation Map）
+  const conversationChannelId = conversation?.channelId
+  const conversationModelId = conversation?.modelId
   React.useEffect(() => {
-    const channelId = conversation?.channelId
-    const modelId = conversation?.modelId
-    if (!channelId || !modelId) return
-
-    setConversationModels((prev) => {
-      const map = new Map(prev)
-      map.set(conversationId, { channelId, modelId })
-      return map
-    })
-  }, [conversationId, conversation?.modelId, conversation?.channelId, setConversationModels])
+    if (conversationChannelId && conversationModelId) {
+      setConversationModels((prev) => {
+        const map = new Map(prev)
+        map.set(conversationId, {
+          channelId: conversationChannelId,
+          modelId: conversationModelId,
+        })
+        return map
+      })
+    }
+  }, [conversationId, conversationChannelId, conversationModelId, setConversationModels])
 
   const syncContextDividers = React.useCallback(async (
     convId: string,

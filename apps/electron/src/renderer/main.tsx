@@ -4,7 +4,7 @@
  * 挂载 React 应用，初始化主题系统。
  */
 
-import React, { useEffect } from 'react'
+import React, { useEffect, useRef } from 'react'
 import ReactDOM from 'react-dom/client'
 import { useSetAtom, useAtomValue, useStore } from 'jotai'
 import App from './App'
@@ -20,6 +20,7 @@ import {
   agentModelIdAtom,
   agentWorkspacesAtom,
   currentAgentWorkspaceIdAtom,
+  currentAgentSessionIdAtom,
   workspaceCapabilitiesVersionAtom,
   workspaceFilesVersionAtom,
   agentPermissionModeAtom,
@@ -38,10 +39,17 @@ import { useGlobalChatListeners } from './hooks/useGlobalChatListeners'
 import { tabsAtom, splitLayoutAtom } from './atoms/tab-atoms'
 import type { TabItem, SplitLayoutState } from './atoms/tab-atoms'
 import { chatToolsAtom } from './atoms/chat-tool-atoms'
+import { feishuBridgeStateAtom } from './atoms/feishu-atoms'
+import { currentConversationIdAtom } from './atoms/chat-atoms'
+import type { FeishuBridgeState, FeishuNotificationSentPayload } from '@proma/shared'
 import { Toaster } from './components/ui/sonner'
 import { toast } from 'sonner'
+import { diffCapabilities } from '@proma/shared'
+import type { WorkspaceCapabilities } from '@proma/shared'
+import { showCapabilityChangeToasts } from './lib/capabilities-toast'
 import { UpdateDialog } from './components/settings/UpdateDialog'
 import './styles/globals.css'
+import 'katex/dist/katex.min.css'
 
 /**
  * 主题初始化组件
@@ -100,6 +108,15 @@ function AgentSettingsInitializer(): null {
   const setMaxBudget = useSetAtom(agentMaxBudgetUsdAtom)
   const setMaxTurns = useSetAtom(agentMaxTurnsAtom)
 
+  // 读取当前工作区信息（用于能力变化 diff）
+  const currentWorkspaceId = useAtomValue(currentAgentWorkspaceIdAtom)
+  const workspaces = useAtomValue(agentWorkspacesAtom)
+
+  // 缓存上一次工作区能力（用于 diff 检测变化）
+  const prevCapabilitiesRef = useRef<WorkspaceCapabilities | null>(null)
+  // 初次加载标记 — 应用启动或切换工作区时不显示 toast
+  const suppressToastRef = useRef(true)
+
   useEffect(() => {
     // 加载设置
     window.electronAPI.getSettings().then((settings) => {
@@ -139,9 +156,44 @@ function AgentSettingsInitializer(): null {
     }).catch(console.error)
   }, [setAgentChannelId, setAgentModelId, setAgentWorkspaces, setCurrentWorkspaceId, setPermissionMode, setThinking, setEffort, setMaxBudget, setMaxTurns])
 
+  // 工作区切换时重置能力缓存，预加载基线
+  useEffect(() => {
+    suppressToastRef.current = true
+    prevCapabilitiesRef.current = null
+
+    if (!currentWorkspaceId) return
+    const ws = workspaces.find((w) => w.id === currentWorkspaceId)
+    if (!ws) return
+
+    window.electronAPI
+      .getWorkspaceCapabilities(ws.slug)
+      .then((caps) => {
+        prevCapabilitiesRef.current = caps
+        suppressToastRef.current = false
+      })
+      .catch(console.error)
+  }, [currentWorkspaceId, workspaces])
+
   // 订阅主进程文件监听推送
   useEffect(() => {
     const unsubCapabilities = window.electronAPI.onCapabilitiesChanged(() => {
+      // 查找当前工作区 slug
+      const ws = workspaces.find((w) => w.id === currentWorkspaceId)
+      if (ws) {
+        window.electronAPI
+          .getWorkspaceCapabilities(ws.slug)
+          .then((newCaps) => {
+            const prevCaps = prevCapabilitiesRef.current
+            if (prevCaps && !suppressToastRef.current) {
+              const changes = diffCapabilities(prevCaps, newCaps)
+              showCapabilityChangeToasts(changes)
+            }
+            prevCapabilitiesRef.current = newCaps
+            suppressToastRef.current = false
+          })
+          .catch(console.error)
+      }
+
       bumpCapabilities((v) => v + 1)
     })
     const unsubFiles = window.electronAPI.onWorkspaceFilesChanged(() => {
@@ -152,7 +204,7 @@ function AgentSettingsInitializer(): null {
       unsubCapabilities()
       unsubFiles()
     }
-  }, [bumpCapabilities, bumpFiles])
+  }, [bumpCapabilities, bumpFiles, currentWorkspaceId, workspaces])
 
   return null
 }
@@ -241,6 +293,65 @@ function ChatToolInitializer(): null {
   return null
 }
 
+/**
+ * 飞书集成初始化组件
+ *
+ * - 订阅飞书 Bridge 状态变化
+ * - 定期上报用户在场状态（用于智能通知路由）
+ * - 监听通知已发送事件（显示 Sonner + 桌面通知）
+ */
+function FeishuInitializer(): null {
+  const store = useStore()
+
+  useEffect(() => {
+    // 加载初始状态
+    window.electronAPI.getFeishuStatus()
+      .then((state: FeishuBridgeState) => store.set(feishuBridgeStateAtom, state))
+      .catch((err: unknown) => console.error('[FeishuInitializer] 加载状态失败:', err))
+
+    // 订阅状态变化
+    const cleanupStatus = window.electronAPI.onFeishuStatusChanged((state: FeishuBridgeState) => {
+      store.set(feishuBridgeStateAtom, state)
+    })
+
+    // 订阅通知已发送事件 → Sonner + 桌面通知
+    const cleanupNotif = window.electronAPI.onFeishuNotificationSent((payload: FeishuNotificationSentPayload) => {
+      toast('已发送到飞书', {
+        description: `${payload.sessionTitle}: ${payload.preview.slice(0, 60)}`,
+        duration: 3000,
+      })
+      // 桌面通知
+      if (Notification.permission === 'granted') {
+        new Notification('Proma → 飞书', {
+          body: `${payload.sessionTitle} 的回复已发送到飞书`,
+        })
+      }
+    })
+
+    // 定期上报在场状态（5 秒间隔 + 焦点变化时即时上报）
+    const reportPresence = (): void => {
+      const activeSessionId = store.get(currentAgentSessionIdAtom) ?? store.get(currentConversationIdAtom)
+      window.electronAPI.reportFeishuPresence({
+        activeSessionId,
+        lastInteractionAt: Date.now(),
+      }).catch(() => { /* 忽略 */ })
+    }
+    const interval = setInterval(reportPresence, 5000)
+    window.addEventListener('focus', reportPresence)
+    window.addEventListener('blur', reportPresence)
+
+    return () => {
+      cleanupStatus()
+      cleanupNotif()
+      clearInterval(interval)
+      window.removeEventListener('focus', reportPresence)
+      window.removeEventListener('blur', reportPresence)
+    }
+  }, [store])
+
+  return null
+}
+
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <ThemeInitializer />
@@ -250,6 +361,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
     <AgentListenersInitializer />
     <ChatToolInitializer />
     <UpdaterInitializer />
+    <FeishuInitializer />
     <App />
     <UpdateDialog />
     <Toaster position="top-right" />

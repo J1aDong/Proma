@@ -22,7 +22,9 @@ import { stopAllGenerations } from './lib/chat-service'
 import { initAutoUpdater, cleanupUpdater } from './lib/updater/auto-updater'
 import { startWorkspaceWatcher, stopWorkspaceWatcher } from './lib/workspace-watcher'
 import { startChatToolsWatcher, stopChatToolsWatcher } from './lib/chat-tools-watcher'
-import { getIsQuitting, setQuitting, isUpdating } from './lib/app-lifecycle'
+import { getIsQuitting, setQuitting } from './lib/app-lifecycle'
+import { feishuBridge } from './lib/feishu-bridge'
+import { getFeishuConfig } from './lib/feishu-config'
 
 let mainWindow: BrowserWindow | null = null
 const DEFAULT_REMOTE_DEBUG_PORT = 9222
@@ -241,6 +243,14 @@ app.whenReady().then(async () => {
     initAutoUpdater(mainWindow)
   }
 
+  // 飞书 Bridge 自动启动（配置启用时）
+  const feishuConfig = getFeishuConfig()
+  if (feishuConfig.enabled && feishuConfig.appId && feishuConfig.appSecret) {
+    feishuBridge.start().catch((err) => {
+      console.error('[飞书 Bridge] 自动启动失败:', err)
+    })
+  }
+
   app.on('activate', () => {
     // 直接检查 mainWindow 引用，避免 getAllWindows() 包含 DevTools 等其他窗口导致误判
     if (!mainWindow || mainWindow.isDestroyed()) {
@@ -264,12 +274,6 @@ app.on('before-quit', () => {
   // 标记正在退出，让 close 事件不再阻止关闭
   setQuitting()
 
-  // 正在安装更新时，让 electron-updater 控制退出流程，不做额外操作
-  if (isUpdating()) {
-    console.log('[应用] 正在安装更新，跳过额外清理')
-    return
-  }
-
   // 中止所有活跃的 Agent 和 Chat 子进程
   stopAllAgents()
   stopAllGenerations()
@@ -279,6 +283,8 @@ app.on('before-quit', () => {
   stopWorkspaceWatcher()
   // 停止 Chat 工具配置文件监听
   stopChatToolsWatcher()
+  // 停止飞书 Bridge
+  feishuBridge.stop()
   // Clean up system tray before quitting
   destroyTray()
 })

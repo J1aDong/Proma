@@ -5,14 +5,14 @@
  * - 创建 AgentOrchestrator / EventBus / Adapter 实例
  * - 注册 EventBus IPC 转发中间件（webContents.send）
  * - 导出 IPC handler 调用的薄包装函数
- * - 文件操作（saveFilesToAgentSession / copyFolderToSession）
+ * - 文件操作（saveFilesToAgentSession）
  *
  * 所有业务逻辑已委托给 AgentOrchestrator。
  */
 
 import { join, dirname } from 'node:path'
 import { writeFileSync, mkdirSync, existsSync } from 'node:fs'
-import { cp, readdir } from 'node:fs/promises'
+import { BrowserWindow } from 'electron'
 import type { WebContents } from 'electron'
 import { AGENT_IPC_CHANNELS } from '@proma/shared'
 import type {
@@ -20,7 +20,6 @@ import type {
   AgentGenerateTitleInput,
   AgentSaveFilesInput,
   AgentSavedFile,
-  AgentCopyFolderInput,
   AgentStreamEvent,
 } from '@proma/shared'
 import { ClaudeAgentAdapter } from './adapters/claude-agent-adapter'
@@ -33,6 +32,9 @@ import { getAgentSessionWorkspacePath } from './config-paths'
 const eventBus = new AgentEventBus()
 const adapter = new ClaudeAgentAdapter()
 const orchestrator = new AgentOrchestrator(adapter, eventBus)
+
+/** 导出 EventBus 供飞书 Bridge 等外部服务订阅事件 */
+export { eventBus as agentEventBus }
 
 /**
  * 会话 → webContents 映射
@@ -102,6 +104,67 @@ export async function runAgent(
 }
 
 /**
+ * 无渲染进程的 Agent 运行（供飞书 Bridge 等外部调用方使用）
+ *
+ * 如果桌面窗口存在，同时注册 webContents 以便事件同步到桌面端 UI。
+ * 事件同时通过 EventBus listeners 分发给飞书 Bridge。
+ */
+export async function runAgentHeadless(
+  input: AgentSendInput,
+  callbacks: {
+    onError: (error: string) => void
+    onComplete: () => void
+    onTitleUpdated: (title: string) => void
+  },
+): Promise<void> {
+  // 尝试注册主窗口 webContents，让流式事件同步推送到桌面端
+  const win = BrowserWindow.getAllWindows()[0]
+  const wc = win && !win.isDestroyed() ? win.webContents : null
+  if (wc) {
+    sessionWebContents.set(input.sessionId, wc)
+  }
+
+  try {
+    await orchestrator.sendMessage(input, {
+      onError: (error) => {
+        callbacks.onError(error)
+        // 同步到渲染进程
+        if (wc && !wc.isDestroyed()) {
+          wc.send(AGENT_IPC_CHANNELS.STREAM_ERROR, {
+            sessionId: input.sessionId,
+            error,
+          })
+        }
+      },
+      onComplete: (messages) => {
+        callbacks.onComplete()
+        // 同步到渲染进程
+        if (wc && !wc.isDestroyed()) {
+          wc.send(AGENT_IPC_CHANNELS.STREAM_COMPLETE, {
+            sessionId: input.sessionId,
+            messages,
+          })
+        }
+      },
+      onTitleUpdated: (title) => {
+        callbacks.onTitleUpdated(title)
+        // 同步到渲染进程
+        if (wc && !wc.isDestroyed()) {
+          wc.send(AGENT_IPC_CHANNELS.TITLE_UPDATED, {
+            sessionId: input.sessionId,
+            title,
+          })
+        }
+      },
+    })
+  } finally {
+    if (!orchestrator.isActive(input.sessionId)) {
+      sessionWebContents.delete(input.sessionId)
+    }
+  }
+}
+
+/**
  * 生成 Agent 会话标题
  */
 export async function generateAgentTitle(input: AgentGenerateTitleInput): Promise<string | null> {
@@ -113,6 +176,13 @@ export async function generateAgentTitle(input: AgentGenerateTitleInput): Promis
  */
 export function stopAgent(sessionId: string): void {
   orchestrator.stop(sessionId)
+}
+
+/**
+ * 检查指定会话是否正在运行
+ */
+export function isAgentSessionActive(sessionId: string): boolean {
+  return orchestrator.isActive(sessionId)
 }
 
 /** 中止所有活跃的 Agent 会话（应用退出时调用） */
@@ -159,39 +229,5 @@ export function saveFilesToAgentSession(input: AgentSaveFilesInput): AgentSavedF
     console.log(`[Agent 服务] 文件已保存: ${targetPath} (${buffer.length} bytes)`)
   }
 
-  return results
-}
-
-/**
- * 复制文件夹到 Agent session 工作目录（异步版本）
- *
- * 使用异步 fs.cp 递归复制整个文件夹，返回所有复制的文件列表。
- */
-export async function copyFolderToSession(input: AgentCopyFolderInput): Promise<AgentSavedFile[]> {
-  const { sourcePath, workspaceSlug, sessionId } = input
-  const sessionDir = getAgentSessionWorkspacePath(workspaceSlug, sessionId)
-
-  const folderName = sourcePath.split('/').filter(Boolean).pop() || 'folder'
-  const targetDir = join(sessionDir, folderName)
-
-  await cp(sourcePath, targetDir, { recursive: true })
-  console.log(`[Agent 服务] 文件夹已复制: ${sourcePath} → ${targetDir}`)
-
-  const results: AgentSavedFile[] = []
-  const collectFiles = async (dir: string, relativeTo: string): Promise<void> => {
-    const items = await readdir(dir, { withFileTypes: true })
-    for (const item of items) {
-      const fullPath = join(dir, item.name)
-      if (item.isDirectory()) {
-        await collectFiles(fullPath, relativeTo)
-      } else {
-        const relPath = fullPath.slice(relativeTo.length + 1)
-        results.push({ filename: relPath, targetPath: fullPath })
-      }
-    }
-  }
-  await collectFiles(targetDir, sessionDir)
-
-  console.log(`[Agent 服务] 文件夹复制完成，共 ${results.length} 个文件`)
   return results
 }
