@@ -10,6 +10,7 @@
 
 import * as React from 'react'
 import { useAtom, useAtomValue, useSetAtom } from 'jotai'
+import { toast } from 'sonner'
 import {
   ArrowRightLeft,
   ChevronDown,
@@ -484,7 +485,7 @@ export function LeftSidebar({ width }: LeftSidebarProps): React.ReactElement {
   }
 
   /** 迁移会话到另一个工作区后的回调 */
-  const handleSessionMoved = (updatedSession: AgentSessionMeta): void => {
+  const handleSessionMoved = (updatedSession: AgentSessionMeta, targetWorkspaceName: string): void => {
     setAgentSessions((prev) =>
       prev.map((s) => (s.id === updatedSession.id ? updatedSession : s))
     )
@@ -496,6 +497,9 @@ export function LeftSidebar({ width }: LeftSidebarProps): React.ReactElement {
       setCurrentAgentSessionId(null)
     }
     setMoveTargetId(null)
+    toast.success('会话已迁移', {
+      description: `已迁移到「${targetWorkspaceName}」，请切换工作区查看`,
+    })
   }
 
   /** Agent 会话按工作区过滤 */
