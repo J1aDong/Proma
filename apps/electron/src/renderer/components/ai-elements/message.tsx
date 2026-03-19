@@ -22,7 +22,7 @@ import Markdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
-import { ChevronDown, ChevronUp, Paperclip, FileText } from 'lucide-react'
+import { ChevronDown, ChevronUp, Paperclip, FileText, Sparkles, Server, Download } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import {
@@ -33,6 +33,7 @@ import {
 } from '@/components/ui/tooltip'
 import { LoadingIndicator } from '@/components/ui/loading-indicator'
 import { CodeBlock, MermaidBlock } from '@proma/ui'
+import { FilePathChip, isAbsoluteFilePath, isRelativeFilePath } from './file-path-chip'
 import type { HTMLAttributes, ComponentProps, ReactNode } from 'react'
 import type { FileAttachment } from '@proma/shared'
 
@@ -50,7 +51,7 @@ export function Message({ className, from, ...props }: MessageProps): React.Reac
   return (
     <div
       className={cn(
-        'group flex w-full flex-col gap-0.5 rounded-[10px] px-2.5 py-2.5 transition-colors duration-300',
+        'group flex w-full flex-col gap-0.5 rounded-[10px] px-2.5 py-2.5',
         from === 'user' ? 'is-user' : 'is-assistant',
         className
       )}
@@ -203,6 +204,8 @@ interface MessageResponseProps {
   className?: string
   /** 标题锚点前缀（用于多页目录跳转） */
   headingIdPrefix?: string
+  /** 基础目录路径，用于解析相对文件路径（如 Agent 会话工作目录） */
+  basePath?: string
 }
 
 export function buildMarkdownHeadingAnchorId(
@@ -224,48 +227,141 @@ export function buildMarkdownHeadingAnchorId(
   return headingIdPrefix ? `${headingIdPrefix}-${withDup}` : withDup
 }
 
+/** 稳定引用的插件数组，避免 react-markdown 每帧重建插件管线 */
+const REMARK_PLUGINS = [remarkGfm, remarkMath]
+const REHYPE_PLUGINS = [rehypeKatex]
+
+// ===== Memo'd Markdown 子组件（稳定引用，避免 react-markdown 每帧重建组件映射） =====
+
+/** 外部链接渲染器 */
+const MarkdownLink = React.memo(function MarkdownLink({
+  href,
+  children: linkChildren,
+  ...linkProps
+}: React.AnchorHTMLAttributes<HTMLAnchorElement>): React.ReactElement {
+  return (
+    <a
+      {...linkProps}
+      href={href}
+      onClick={(e) => {
+        e.preventDefault()
+        if (href && (href.startsWith('http://') || href.startsWith('https://'))) {
+          window.electronAPI.openExternal(href)
+        }
+      }}
+      title={href}
+    >
+      {linkChildren}
+    </a>
+  )
+})
+
+/** 递归提取纯文本（children 可能是字符串数组） */
+function extractText(node: React.ReactNode): string {
+  if (typeof node === 'string') return node
+  if (typeof node === 'number') return String(node)
+  if (!node) return ''
+  if (Array.isArray(node)) return node.map(extractText).join('')
+  if (React.isValidElement(node)) {
+    return extractText((node.props as { children?: React.ReactNode }).children)
+  }
+  return ''
+}
+
+/** 代码块 / Mermaid 渲染器 */
+const MarkdownPre = React.memo(function MarkdownPre({
+  children: preChildren,
+}: { children?: React.ReactNode }): React.ReactElement {
+  const codeChild = React.Children.toArray(preChildren).find(
+    (child): child is React.ReactElement =>
+      React.isValidElement(child) && (child as React.ReactElement).type === 'code'
+  ) as React.ReactElement | undefined
+
+  if (codeChild) {
+    const codeProps = codeChild.props as { className?: string; children?: React.ReactNode }
+    if (codeProps.className?.includes('language-mermaid')) {
+      const mermaidCode = extractText(codeProps.children).replace(/\n$/, '')
+      return <MermaidBlock code={mermaidCode} />
+    }
+  }
+
+  return <CodeBlock>{preChildren}</CodeBlock>
+})
+
+/** 行内代码 / 文件路径渲染器 */
+const MarkdownInlineCode = React.memo(function MarkdownInlineCode({
+  children: codeChildren,
+  className: codeClassName,
+  basePath,
+  ...codeProps
+}: React.HTMLAttributes<HTMLElement> & { basePath?: string }): React.ReactElement {
+  if (codeClassName) {
+    return <code className={codeClassName} {...codeProps}>{codeChildren}</code>
+  }
+
+  const text = typeof codeChildren === 'string' ? codeChildren : ''
+
+  if (text) {
+    if (isAbsoluteFilePath(text)) {
+      return <FilePathChip filePath={text.trim()} />
+    }
+    if (basePath && isRelativeFilePath(text)) {
+      return <FilePathChip filePath={text.trim()} basePath={basePath} />
+    }
+  }
+
+  return <code {...codeProps}>{codeChildren}</code>
+})
+
 /** 使用 react-markdown 渲染 assistant 消息内容，代码块使用 Shiki 语法高亮 */
 export const MessageResponse = React.memo(
-  function MessageResponse({ children, className, headingIdPrefix }: MessageResponseProps): React.ReactElement {
-    const extractText = React.useCallback((node: React.ReactNode): string => {
-      if (typeof node === 'string') return node
-      if (typeof node === 'number') return String(node)
-      if (!node) return ''
-      if (Array.isArray(node)) return node.map(extractText).join('')
-      if (React.isValidElement(node)) {
-        return extractText((node.props as { children?: React.ReactNode }).children)
-      }
-      return ''
-    }, [])
+  function MessageResponse({
+    children,
+    className,
+    headingIdPrefix,
+    basePath,
+  }: MessageResponseProps): React.ReactElement {
+    const components = React.useMemo(() => {
+      const headingIdMap = new Map<string, number>()
 
-    // 这里必须在每次 render 时重建，避免 StrictMode 双渲染把计数累加到 -1/-2。
-    const headingIdMap = new Map<string, number>()
-    const buildHeadingId = (rawText: string): string => {
-      return buildMarkdownHeadingAnchorId(rawText, headingIdMap, headingIdPrefix)
-    }
+      const renderHeading = (
+        level: 1 | 2 | 3 | 4 | 5 | 6,
+        props: React.HTMLAttributes<HTMLHeadingElement> & { children?: React.ReactNode },
+      ): React.ReactElement => {
+        const text = extractText(props.children)
+        const anchorId = buildMarkdownHeadingAnchorId(text, headingIdMap, headingIdPrefix)
+        const headingClassName = cn('scroll-mt-20', props.className)
 
-    const renderHeading = React.useCallback((
-      level: 1 | 2 | 3 | 4 | 5 | 6,
-      props: React.HTMLAttributes<HTMLHeadingElement> & { children?: React.ReactNode },
-    ): React.ReactElement => {
-      const text = extractText(props.children)
-      const anchorId = buildHeadingId(text)
-      const headingClass = 'scroll-mt-20'
-      switch (level) {
-        case 1:
-          return <h1 {...props} id={anchorId} data-heading-id={anchorId} className={cn(headingClass, props.className)} />
-        case 2:
-          return <h2 {...props} id={anchorId} data-heading-id={anchorId} className={cn(headingClass, props.className)} />
-        case 3:
-          return <h3 {...props} id={anchorId} data-heading-id={anchorId} className={cn(headingClass, props.className)} />
-        case 4:
-          return <h4 {...props} id={anchorId} data-heading-id={anchorId} className={cn(headingClass, props.className)} />
-        case 5:
-          return <h5 {...props} id={anchorId} data-heading-id={anchorId} className={cn(headingClass, props.className)} />
-        default:
-          return <h6 {...props} id={anchorId} data-heading-id={anchorId} className={cn(headingClass, props.className)} />
+        switch (level) {
+          case 1:
+            return <h1 {...props} id={anchorId} data-heading-id={anchorId} className={headingClassName} />
+          case 2:
+            return <h2 {...props} id={anchorId} data-heading-id={anchorId} className={headingClassName} />
+          case 3:
+            return <h3 {...props} id={anchorId} data-heading-id={anchorId} className={headingClassName} />
+          case 4:
+            return <h4 {...props} id={anchorId} data-heading-id={anchorId} className={headingClassName} />
+          case 5:
+            return <h5 {...props} id={anchorId} data-heading-id={anchorId} className={headingClassName} />
+          default:
+            return <h6 {...props} id={anchorId} data-heading-id={anchorId} className={headingClassName} />
+        }
       }
-    }, [buildHeadingId, extractText])
+
+      return {
+        h1: (props: React.HTMLAttributes<HTMLHeadingElement>) => renderHeading(1, props),
+        h2: (props: React.HTMLAttributes<HTMLHeadingElement>) => renderHeading(2, props),
+        h3: (props: React.HTMLAttributes<HTMLHeadingElement>) => renderHeading(3, props),
+        h4: (props: React.HTMLAttributes<HTMLHeadingElement>) => renderHeading(4, props),
+        h5: (props: React.HTMLAttributes<HTMLHeadingElement>) => renderHeading(5, props),
+        h6: (props: React.HTMLAttributes<HTMLHeadingElement>) => renderHeading(6, props),
+        a: MarkdownLink,
+        pre: MarkdownPre,
+        code: (props: React.HTMLAttributes<HTMLElement>) => (
+          <MarkdownInlineCode {...props} basePath={basePath} />
+        ),
+      }
+    }, [basePath, children, headingIdPrefix])
 
     return (
       <div
@@ -278,48 +374,9 @@ export const MessageResponse = React.memo(
         )}
       >
         <Markdown
-          remarkPlugins={[remarkGfm, remarkMath]}
-          rehypePlugins={[rehypeKatex]}
-          components={{
-            h1: (props) => renderHeading(1, props),
-            h2: (props) => renderHeading(2, props),
-            h3: (props) => renderHeading(3, props),
-            h4: (props) => renderHeading(4, props),
-            h5: (props) => renderHeading(5, props),
-            h6: (props) => renderHeading(6, props),
-            a: ({ href, children: linkChildren, ...linkProps }) => (
-              <a
-                {...linkProps}
-                href={href}
-                onClick={(e) => {
-                  e.preventDefault()
-                  if (href && (href.startsWith('http://') || href.startsWith('https://'))) {
-                    window.electronAPI.openExternal(href)
-                  }
-                }}
-                title={href}
-              >
-                {linkChildren}
-              </a>
-            ),
-            pre: ({ children: preChildren }) => {
-              // 检测子 <code> 元素的 className 是否包含 language-mermaid
-              const codeChild = React.Children.toArray(preChildren).find(
-                (child): child is React.ReactElement =>
-                  React.isValidElement(child) && (child as React.ReactElement).type === 'code'
-              ) as React.ReactElement | undefined
-
-              if (codeChild) {
-                const codeProps = codeChild.props as { className?: string; children?: React.ReactNode }
-                if (codeProps.className?.includes('language-mermaid')) {
-                  const mermaidCode = extractText(codeProps.children).replace(/\n$/, '')
-                  return <MermaidBlock code={mermaidCode} />
-                }
-              }
-
-              return <CodeBlock>{preChildren}</CodeBlock>
-            },
-          }}
+          remarkPlugins={REMARK_PLUGINS}
+          rehypePlugins={REHYPE_PLUGINS}
+          components={components}
         >
           {children}
         </Markdown>
@@ -330,6 +387,7 @@ export const MessageResponse = React.memo(
     prevProps.children === nextProps.children
     && prevProps.className === nextProps.className
     && prevProps.headingIdPrefix === nextProps.headingIdPrefix
+    && prevProps.basePath === nextProps.basePath
   )
 )
 
@@ -338,8 +396,8 @@ export const MessageResponse = React.memo(
 /** 折叠行数阈值 */
 const COLLAPSE_LINE_THRESHOLD = 4
 
-/** 将文本中的 @file:路径 替换为样式化 chip */
-const FILE_MENTION_RE = /@file:(\S+)/g
+/** 将文本中的 @file:路径、/skill:名称、#mcp:名称 替换为样式化 chip */
+const MENTION_RE = /@file:(\S+)|\/skill:(\S+)|#mcp:(\S+)/g
 
 function renderTextWithMentions(text: string): React.ReactNode {
   const parts: React.ReactNode[] = []
@@ -347,26 +405,46 @@ function renderTextWithMentions(text: string): React.ReactNode {
   let match: RegExpExecArray | null
 
   // 重置 lastIndex（全局正则复用时需要）
-  FILE_MENTION_RE.lastIndex = 0
+  MENTION_RE.lastIndex = 0
 
-  while ((match = FILE_MENTION_RE.exec(text)) !== null) {
+  while ((match = MENTION_RE.exec(text)) !== null) {
     // 添加 match 前的纯文本
     if (match.index > lastIndex) {
       parts.push(text.slice(lastIndex, match.index))
     }
-    // 渲染 mention chip
-    const filePath = match[1] ?? ''
-    const fileName = filePath.split('/').pop() || filePath
-    parts.push(
-      <span
-        key={`mention-${match.index}`}
-        className="inline-flex items-center gap-0.5 bg-primary/10 text-primary rounded px-1 py-[1px] text-[13px] font-medium whitespace-nowrap align-baseline"
-        title={filePath}
-      >
-        <FileText className="size-3 inline shrink-0" />
-        {fileName}
-      </span>
-    )
+
+    const key = `mention-${match.index}`
+
+    if (match[1]) {
+      // @file: 文件引用 — 蓝色 chip
+      const filePath = match[1]
+      const fileName = filePath.split('/').pop() || filePath
+      parts.push(
+        <span key={key} className="inline-flex items-center gap-0.5 bg-primary/10 text-primary rounded px-1 py-[1px] text-[13px] font-medium whitespace-nowrap align-baseline" title={filePath}>
+          <FileText className="size-3 inline shrink-0" />
+          {fileName}
+        </span>
+      )
+    } else if (match[2]) {
+      // /skill: Skill 引用 — 紫色 chip
+      const skillName = match[2]
+      parts.push(
+        <span key={key} className="inline-flex items-center gap-0.5 rounded px-1 py-[1px] text-[13px] font-medium whitespace-nowrap align-baseline bg-[hsl(270_60%_60%/0.15)] text-[hsl(270_60%_50%)]">
+          <Sparkles className="size-3 inline shrink-0" />
+          {skillName}
+        </span>
+      )
+    } else if (match[3]) {
+      // #mcp: MCP 引用 — 绿色 chip
+      const mcpName = match[3]
+      parts.push(
+        <span key={key} className="inline-flex items-center gap-0.5 rounded px-1 py-[1px] text-[13px] font-medium whitespace-nowrap align-baseline bg-[hsl(160_60%_45%/0.15)] text-[hsl(160_60%_35%)]">
+          <Server className="size-3 inline shrink-0" />
+          {mcpName}
+        </span>
+      )
+    }
+
     lastIndex = match.index + match[0].length
   }
 
@@ -547,6 +625,11 @@ function MessageAttachmentImage({ attachment, isSingle = false }: MessageAttachm
       })
   }, [attachment.localPath, attachment.mediaType])
 
+  /** 保存图片到本地 */
+  const handleSave = React.useCallback((): void => {
+    window.electronAPI.saveImageAs(attachment.localPath, attachment.filename)
+  }, [attachment.localPath, attachment.filename])
+
   if (!imageSrc) {
     return (
       <div className={cn(
@@ -556,7 +639,7 @@ function MessageAttachmentImage({ attachment, isSingle = false }: MessageAttachm
     )
   }
 
-  return isSingle ? (
+  const imgElement = isSingle ? (
     <img
       src={imageSrc}
       alt={attachment.filename}
@@ -568,6 +651,20 @@ function MessageAttachmentImage({ attachment, isSingle = false }: MessageAttachm
       alt={attachment.filename}
       className="size-[280px] rounded-lg object-cover shrink-0"
     />
+  )
+
+  return (
+    <div className="relative group inline-block">
+      {imgElement}
+      <button
+        type="button"
+        onClick={handleSave}
+        className="absolute bottom-2 right-2 p-1.5 rounded-md bg-black/50 text-white opacity-0 group-hover:opacity-100 transition-opacity hover:bg-black/70"
+        title="保存图片"
+      >
+        <Download className="size-4" />
+      </button>
+    </div>
   )
 }
 

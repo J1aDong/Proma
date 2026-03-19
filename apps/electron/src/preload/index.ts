@@ -51,8 +51,10 @@ import type {
   AgentWorkspace,
   AgentGenerateTitleInput,
   AgentSaveFilesInput,
+  AgentSaveWorkspaceFilesInput,
   AgentSavedFile,
   AgentAttachDirectoryInput,
+  WorkspaceAttachDirectoryInput,
   GetTaskOutputInput,
   GetTaskOutputResult,
   StopTaskInput,
@@ -235,6 +237,9 @@ export interface ElectronAPI {
 
   /** 读取附件（返回 base64 字符串） */
   readAttachment: (localPath: string) => Promise<string>
+
+  /** 另存图片到用户选择的位置（原生 Save As 对话框） */
+  saveImageAs: (localPath: string, defaultFilename: string) => Promise<boolean>
 
   /** 删除附件 */
   deleteAttachment: (localPath: string) => Promise<void>
@@ -524,6 +529,12 @@ export interface ElectronAPI {
   /** 保存文件到 Agent session 工作目录 */
   saveFilesToAgentSession: (input: AgentSaveFilesInput) => Promise<AgentSavedFile[]>
 
+  /** 保存文件到工作区文件目录 */
+  saveFilesToWorkspaceFiles: (input: AgentSaveWorkspaceFilesInput) => Promise<AgentSavedFile[]>
+
+  /** 获取工作区文件目录路径 */
+  getWorkspaceFilesPath: (workspaceSlug: string) => Promise<string>
+
   /** 打开文件夹选择对话框 */
   openFolderDialog: () => Promise<{ path: string; name: string } | null>
 
@@ -532,6 +543,15 @@ export interface ElectronAPI {
 
   /** 移除会话的附加目录 */
   detachDirectory: (input: AgentAttachDirectoryInput) => Promise<string[]>
+
+  /** 附加外部目录到工作区（所有会话可访问） */
+  attachWorkspaceDirectory: (input: WorkspaceAttachDirectoryInput) => Promise<string[]>
+
+  /** 移除工作区的附加目录 */
+  detachWorkspaceDirectory: (input: WorkspaceAttachDirectoryInput) => Promise<string[]>
+
+  /** 获取工作区附加目录列表 */
+  getWorkspaceDirectories: (workspaceSlug: string) => Promise<string[]>
 
   // ===== Agent 文件系统操作 =====
 
@@ -549,6 +569,9 @@ export interface ElectronAPI {
 
   /** 在系统文件管理器中显示文件 */
   showInFolder: (filePath: string) => Promise<void>
+
+  /** 在新窗口中预览文件 */
+  previewFile: (filePath: string) => Promise<void>
 
   /** 重命名文件/目录 */
   renameFile: (filePath: string, newName: string) => Promise<void>
@@ -788,6 +811,10 @@ const electronAPI: ElectronAPI = {
 
   readAttachment: (localPath: string) => {
     return ipcRenderer.invoke(CHAT_IPC_CHANNELS.READ_ATTACHMENT, localPath)
+  },
+
+  saveImageAs: (localPath: string, defaultFilename: string) => {
+    return ipcRenderer.invoke(CHAT_IPC_CHANNELS.SAVE_IMAGE_AS, localPath, defaultFilename)
   },
 
   deleteAttachment: (localPath: string) => {
@@ -1189,6 +1216,14 @@ const electronAPI: ElectronAPI = {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.SAVE_FILES_TO_SESSION, input)
   },
 
+  saveFilesToWorkspaceFiles: (input: AgentSaveWorkspaceFilesInput) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.SAVE_FILES_TO_WORKSPACE, input)
+  },
+
+  getWorkspaceFilesPath: (workspaceSlug: string) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.GET_WORKSPACE_FILES_PATH, workspaceSlug)
+  },
+
   openFolderDialog: () => {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.OPEN_FOLDER_DIALOG)
   },
@@ -1199,6 +1234,18 @@ const electronAPI: ElectronAPI = {
 
   detachDirectory: (input: AgentAttachDirectoryInput) => {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.DETACH_DIRECTORY, input)
+  },
+
+  attachWorkspaceDirectory: (input: WorkspaceAttachDirectoryInput) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.ATTACH_WORKSPACE_DIRECTORY, input)
+  },
+
+  detachWorkspaceDirectory: (input: WorkspaceAttachDirectoryInput) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.DETACH_WORKSPACE_DIRECTORY, input)
+  },
+
+  getWorkspaceDirectories: (workspaceSlug: string) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.GET_WORKSPACE_DIRECTORIES, workspaceSlug)
   },
 
   // Agent 文件系统操作
@@ -1220,6 +1267,10 @@ const electronAPI: ElectronAPI = {
 
   showInFolder: (filePath: string) => {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.SHOW_IN_FOLDER, filePath)
+  },
+
+  previewFile: (filePath: string) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.PREVIEW_FILE, filePath)
   },
 
   renameFile: (filePath: string, newName: string) => {
